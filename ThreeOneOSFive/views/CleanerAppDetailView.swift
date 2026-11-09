@@ -203,9 +203,12 @@ struct CleanerAppDetailView: View {
     }
 
     private func entryRow(_ entry: InventoryEntry) -> some View {
-        HStack(spacing: 10) {
-            selectionControl(entry)
-
+        // Navigation goes through an invisible background link so the whole
+        // row drills in, while the checkbox/lock stays an independent
+        // control on top. A row-level long-press gesture previously sat on
+        // the same container and swallowed the link's taps; unlocking now
+        // happens by tapping the lock itself.
+        ZStack {
             if entry.isDirectory {
                 NavigationLink {
                     CleanerAppDetailView(
@@ -215,19 +218,16 @@ struct CleanerAppDetailView: View {
                         model: model
                     )
                 } label: {
-                    entryContent(entry)
+                    EmptyView()
                 }
-                .buttonStyle(.plain)
-            } else {
+                .opacity(0)
+            }
+            HStack(spacing: 10) {
+                selectionControl(entry)
                 entryContent(entry)
             }
         }
         .contentShape(Rectangle())
-        .onLongPressGesture {
-            if entry.isProtected && !model.unlockedPaths.contains(entry.relativePath) {
-                pendingUnlock = entry
-            }
-        }
     }
 
     private func entryContent(_ entry: InventoryEntry) -> some View {

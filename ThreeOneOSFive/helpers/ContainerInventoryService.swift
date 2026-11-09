@@ -137,6 +137,7 @@ enum ContainerInventoryService {
             components: components,
             relativeTo: rootDescriptor
         ) else {
+            log("inventory: level \(relativePath.isEmpty ? "<root>" : relativePath) open failed errno=\(errno)")
             return []
         }
         defer { close(levelDescriptor) }
@@ -179,6 +180,7 @@ enum ContainerInventoryService {
                 break
             }
         }
+        log("inventory: level \(relativePath.isEmpty ? "<root>" : relativePath) entries=\(entries.count)")
         return entries.sorted {
             $0.name.localizedCaseInsensitiveCompare($1.name) == .orderedAscending
         }
@@ -276,9 +278,24 @@ enum ContainerInventoryService {
                     continue
                 }
                 let before = scanDirectory(childDescriptor)
-                var summary = RemovalSummary()
-                removeDirectoryContents(childDescriptor, summary: &summary)
                 close(childDescriptor)
+                // scanDirectory consumed the directory offset of that fd
+                // (dup shares the open file description), so removal must
+                // traverse a freshly opened descriptor — reusing the
+                // scanned one makes removal see an empty directory and the
+                // final rmdir fails with ENOTEMPTY.
+                let removalDescriptor = name.withCString {
+                    openat(parentDescriptor, $0, O_RDONLY | O_DIRECTORY | O_CLOEXEC | O_NOFOLLOW)
+                }
+                guard removalDescriptor >= 0 else {
+                    log("inventory: delete \(relativePath) reopen for removal failed errno=\(errno)")
+                    failed += 1
+                    close(parentDescriptor)
+                    continue
+                }
+                var summary = RemovalSummary()
+                removeDirectoryContents(removalDescriptor, summary: &summary)
+                close(removalDescriptor)
                 let result = name.withCString {
                     unlinkat(parentDescriptor, $0, AT_REMOVEDIR)
                 }

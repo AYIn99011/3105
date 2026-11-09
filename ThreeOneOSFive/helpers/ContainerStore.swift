@@ -751,36 +751,33 @@ enum ContainerStore {
 
     // MARK: - Display names from bundle containers
 
-    private static var cachedBundleDisplayNames: [String: String]?
-
-    /// Friendly names live in each app bundle's Info.plist, under
-    /// /var/containers/Bundle/Application/<uuid>/<App>.app — a different
-    /// tree from the data containers. Read directly when possible and fall
-    /// back to a worse_query grant per bundle container when not.
-    static func bundleDisplayNames() -> [String: String] {
-        if let cachedBundleDisplayNames { return cachedBundleDisplayNames }
+    /// Friendly names live in each app bundle's Info.plist. The bundle
+    /// container for a known bundle ID is a class-1 MCM path lookup (path
+    /// lookups are not gated by the sandbox-token check), then a plain
+    /// read, with a worse_query grant as fallback. Enumerating the bundle
+    /// tree by inode walk found almost nothing, so look up directly.
+    static func bundleDisplayNames(for bundleIDs: [String]) -> [String: String] {
         var map: [String: String] = [:]
-        let root = "/var/containers/Bundle/Application"
-        let dirs = enumerateDirectories(path: root).filter {
-            UUID(uuidString: ($0 as NSString).lastPathComponent) != nil
-        }
         var grantedReads = 0
-        for dir in dirs {
-            let canonical = ContainerDiscoveryMerger.canonicalPath(dir)
-            if let pair = readBundleIdentity(containerPath: canonical) {
-                map[pair.bundleID] = pair.name
+        for bundleID in bundleIDs {
+            var lookupError: NSString?
+            guard let path = MCMContainerPathForIdentifier(1, bundleID, false, &lookupError) else {
+                continue
+            }
+            let canonical = ContainerDiscoveryMerger.canonicalPath(path)
+            if let pair = readBundleIdentity(containerPath: canonical), pair.bundleID == bundleID {
+                map[bundleID] = pair.name
                 continue
             }
             let handle = grantContainerAccess(canonical, logFailure: false)
             guard handle >= 0 else { continue }
-            if let pair = readBundleIdentity(containerPath: canonical) {
-                map[pair.bundleID] = pair.name
+            if let pair = readBundleIdentity(containerPath: canonical), pair.bundleID == bundleID {
+                map[bundleID] = pair.name
                 grantedReads += 1
             }
             worse_query_release(handle)
         }
-        log("cleaner: bundle names containers=\(dirs.count) mapped=\(map.count) grantedReads=\(grantedReads)")
-        cachedBundleDisplayNames = map
+        log("cleaner: bundle names requested=\(bundleIDs.count) mapped=\(map.count) grantedReads=\(grantedReads)")
         return map
     }
 
@@ -837,7 +834,6 @@ enum ContainerStore {
         if let first = dirs.first {
             probeContainerAccess(containerPath: ContainerDiscoveryMerger.canonicalPath(first))
         }
-        let displayNames = bundleDisplayNames()
         var resolved: [InstalledApp] = []
         var grantedCount = 0
         var identifiedCount = 0
@@ -897,9 +893,7 @@ enum ContainerStore {
             let info = appInfoForBundleID(bundleID) as? [String: Any] ?? [:]
             let app = InstalledApp(
                 bundleID: bundleID,
-                name: displayName.isEmpty
-                    ? (displayNames[bundleID] ?? bundleID)
-                    : displayName,
+                name: displayName.isEmpty ? bundleID : displayName,
                 containerPath: canonical,
                 version: info["version"] as? String ?? "",
                 icon: info["icon"] as? UIImage
@@ -919,6 +913,19 @@ enum ContainerStore {
             }
         }
         log("cleaner: filesystem resolve total=\(dirs.count) granted=\(grantedCount) identified=\(identifiedCount) (metadata=\(metadataIdentifiedCount) prefs=\(prefsIdentifiedCount) verified=\(verifiedIdentifiedCount)) failed=\(failedCount)")
+        let friendlyNames = bundleDisplayNames(for: resolved.map(\.bundleID))
+        if !friendlyNames.isEmpty {
+            resolved = resolved.map { app in
+                guard let friendly = friendlyNames[app.bundleID] else { return app }
+                return InstalledApp(
+                    bundleID: app.bundleID,
+                    name: friendly,
+                    containerPath: app.containerPath,
+                    version: app.version,
+                    icon: app.icon
+                )
+            }
+        }
         return resolved
     }
 
