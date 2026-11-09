@@ -229,7 +229,7 @@ enum ContainerInventoryService {
         relativePaths: [String]
     ) -> InventoryDeletionResult {
         guard let rootDescriptor = openContainerRoot(containerPath) else {
-            DiagnosticsLog.shared.log("inventory: delete aborted, container root not openable \(containerPath)")
+            log("inventory: delete aborted, container root not openable \(containerPath)")
             return InventoryDeletionResult(
                 removedItemCount: 0,
                 failedItemCount: relativePaths.count,
@@ -250,7 +250,7 @@ enum ContainerInventoryService {
                 components: parentComponents,
                 relativeTo: rootDescriptor
             ) else {
-                DiagnosticsLog.shared.log("inventory: delete \(relativePath) parent open failed errno=\(errno)")
+                log("inventory: delete \(relativePath) parent open failed errno=\(errno)")
                 failed += 1
                 continue
             }
@@ -270,7 +270,7 @@ enum ContainerInventoryService {
                     openat(parentDescriptor, $0, O_RDONLY | O_DIRECTORY | O_CLOEXEC | O_NOFOLLOW)
                 }
                 guard childDescriptor >= 0 else {
-                    DiagnosticsLog.shared.log("inventory: delete \(relativePath) dir open failed errno=\(errno)")
+                    log("inventory: delete \(relativePath) dir open failed errno=\(errno)")
                     failed += 1
                     close(parentDescriptor)
                     continue
@@ -283,7 +283,7 @@ enum ContainerInventoryService {
                     unlinkat(parentDescriptor, $0, AT_REMOVEDIR)
                 }
                 if result != 0 {
-                    DiagnosticsLog.shared.log("inventory: delete \(relativePath) rmdir failed errno=\(errno) removedContents=\(summary.removedItemCount) failedContents=\(summary.failedItemCount)")
+                    log("inventory: delete \(relativePath) rmdir failed errno=\(errno) removedContents=\(summary.removedItemCount) failedContents=\(summary.failedItemCount)")
                 }
                 if result == 0 {
                     removed += summary.removedItemCount
