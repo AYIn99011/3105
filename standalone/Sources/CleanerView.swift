@@ -89,7 +89,12 @@ struct CleanerView: View {
             .scrollDismissesKeyboard(.interactively)
             .toolbar { toolbarContent }
             .alert(item: $activeAlert, content: alert(for:))
-            .sheet(item: $typePanelApp) { app in
+            .sheet(item: $typePanelApp, onDismiss: {
+                // Dismissing a sheet does not re-fire onAppear, so the
+                // dirty marks the type panel left behind are consumed
+                // here; otherwise the list keeps showing pre-clean sizes.
+                refreshDirtyContainers()
+            }) { app in
                 AppTypeCleanView(app: app)
             }
             .onAppear {
