@@ -507,7 +507,16 @@ struct CleanerView: View {
             ) { _ in }
             collect(mhaApps, into: &activationCandidates)
 
-            collect(ContainerStore.resolvedFilesystemApps(), into: &directApps)
+            let filesystemApps = ContainerStore.resolvedFilesystemApps()
+            collect(filesystemApps, into: &directApps)
+            // Every filesystem-resolved app stays reachable as a
+            // fallback: if an ID was claimed by an earlier source but
+            // its activation fails, the granted filesystem path is
+            // scanned instead of dropping the app entirely.
+            let directByID = Dictionary(
+                filesystemApps.map { ($0.bundleID, $0) },
+                uniquingKeysWith: { first, _ in first }
+            )
             log("cleaner: filesystem direct records added=\(directApps.count)")
 
             // Phase 2 (parallel): activation + cache/tmp usage scan.
@@ -530,11 +539,15 @@ struct CleanerView: View {
                 let job = jobs[index]
                 var record: CleanerAppRecord?
                 if ContainerPresentationPolicy.shouldShow(bundleID: job.app.bundleID) {
+                    var sourceApp = job.app
                     let containerPath: String?
                     if job.needsActivation {
                         if let resolved = ContainerStore.resolveAppContainerPath(bundleID: job.app.bundleID),
                            ContainerStore.isApplicationContainerPath(resolved) {
                             containerPath = resolved
+                        } else if let direct = directByID[job.app.bundleID] {
+                            sourceApp = direct
+                            containerPath = direct.containerPath
                         } else {
                             containerPath = nil
                         }
@@ -548,11 +561,11 @@ struct CleanerView: View {
                        ) {
                         record = CleanerAppRecord(
                             app: InstalledApp(
-                                bundleID: job.app.bundleID,
-                                name: job.app.name,
+                                bundleID: sourceApp.bundleID,
+                                name: sourceApp.name,
                                 containerPath: containerPath,
-                                version: job.app.version,
-                                icon: job.app.icon
+                                version: sourceApp.version,
+                                icon: sourceApp.icon
                             ),
                             usage: usage
                         )
