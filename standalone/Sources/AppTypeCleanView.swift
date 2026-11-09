@@ -105,15 +105,24 @@ enum FolderTypeClassifier {
             || lower == "splashboard" || lower == "saved application state" { return .webData }
         if lower == "logs" || lower == "log" || lower.contains("_log") || lower.hasPrefix("log_")
             || lower.contains("logging") || lower.contains("crash")
-            || lower.contains("applog") || lower.contains("monitor") { return .logs }
+            || lower.contains("applog") || lower.contains("monitor")
+            || lower == "alog" || lower == "xlog" || lower.hasSuffix(".xlog") { return .logs }
         if lower.contains("pitaya") || lower.contains("voice") || lower.contains("model")
             || lower.contains("render") || lower.contains("emotion")
-            || lower.contains("effect") || lower.contains("gesture") { return .modelsAssets }
+            || lower.contains("effect") || lower.contains("gesture")
+            || lower.hasPrefix("skin") || lower.contains("_skin")
+            || lower.contains("tts") { return .modelsAssets }
         if lower.contains("webapp") || lower.contains("ajx") || lower.contains("nebula")
             || lower.contains("namapp") || lower == "drb" || lower.contains("lynx")
             || lower.contains("h5") || lower.contains("cloudres")
             || lower.contains("offline") || lower.contains("download")
-            || lower.contains("hybrid") { return .dynamicPackage }
+            || lower.contains("hybrid") || lower.contains("codepush") { return .dynamicPackage }
+        // Player-engine media caches and ad-SDK creative caches: pure
+        // re-downloadable payloads despite living in persistent zones.
+        if lower.contains("video_engine") || lower.hasSuffix(".mdl")
+            || lower.contains("ttplayer") || lower.contains("ttvod")
+            || lower.contains("ijkplayer") || lower.contains("buadsdk")
+            || lower.contains("pangle") { return .cache }
         if lower.contains("cache") { return .cache }
         return .other
     }
