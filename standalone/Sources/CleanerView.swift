@@ -745,25 +745,25 @@ struct CleanerView: View {
                     continue
                 }
 
-                do {
-                    let result = try LimitedCleanerService.clean(
-                        containerURL: URL(fileURLWithPath: containerPath, isDirectory: true),
-                        rootValidator: { ContainerStore.isApplicationContainerPath($0.path) }
-                    )
-                    updatedUsage[record.id] = result.after
-                    freedByID[record.id] = result.freedBytes
-                    freedBytes += result.freedBytes
-                    removedItems += result.removedItemCount
-                    failedItems += result.failedItemCount
-                    log(
-                        "cleaner: cleaned \(record.app.bundleID) " +
-                            "freed=\(result.freedBytes) removed=\(result.removedItemCount) " +
-                            "failed=\(result.failedItemCount)"
-                    )
-                } catch {
-                    unavailableApps += 1
-                    log("cleaner: failed \(record.app.bundleID) error=\(error)")
+                // Same logic as the long-press type panel: scan inside
+                // the container and delete only the classified,
+                // pre-selected types — never the whole container.
+                let outcome = AppTypeCleanView.cleanDefaultTypes(containerPath: containerPath)
+                if let usage = try? LimitedCleanerService.scan(
+                    containerURL: URL(fileURLWithPath: containerPath, isDirectory: true),
+                    rootValidator: { ContainerStore.isApplicationContainerPath($0.path) }
+                ) {
+                    updatedUsage[record.id] = usage
                 }
+                freedByID[record.id] = outcome.freedBytes
+                freedBytes += outcome.freedBytes
+                removedItems += outcome.removedItemCount
+                failedItems += outcome.failedItemCount
+                log(
+                    "cleaner: type-cleaned \(record.app.bundleID) " +
+                        "freed=\(outcome.freedBytes) removed=\(outcome.removedItemCount) " +
+                        "failed=\(outcome.failedItemCount)"
+                )
             }
 
             let resultMessage = language.text(

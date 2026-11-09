@@ -84,10 +84,10 @@
 
 "cleaner.title" = "Cleaner";
 "cleaner.limited_mode" = "Limited Cleanup";
-"cleaner.available" = "Available to clean";
+"cleaner.available" = "Total app size";
 "cleaner.selected" = "Selected";
 "cleaner.selected_summary" = "%lld apps · %@";
-"cleaner.scope_footer" = "Only Library/Caches and tmp are removed. Documents, preferences and Keychain stay unchanged.";
+"cleaner.scope_footer" = "Type-based cleaning: each app is scanned inside and only regenerable caches, dynamic packages, logs and model assets are removed. Databases, account data, preferences and Keychain stay unchanged.";
 "cleaner.apps_with_cache" = "%lld apps with temporary data";
 "cleaner.apps_footer" = "Only apps with removable temporary data are shown.";
 "cleaner.scanned_count" = "%lld scanned";
@@ -98,10 +98,10 @@
 "cleaner.empty_message" = "No removable data was found in Library/Caches or tmp.";
 "cleaner.selection_actions" = "Selection actions";
 "cleaner.scan_again" = "Scan again";
-"cleaner.clean_button" = "Clean %@";
+"cleaner.clean_button" = "Clean by Type";
 "cleaner.cleaning" = "Cleaning…";
-"cleaner.confirm_title" = "Delete temporary data?";
-"cleaner.confirm_message" = "3105 will permanently delete Library/Caches and tmp from %lld selected apps (%@). Close those apps first. They may open more slowly while rebuilding caches. This cannot be undone.";
+"cleaner.confirm_title" = "Clean by type?";
+"cleaner.confirm_message" = "Each of the %lld selected apps (%@ in total) will be scanned inside; only classified caches, dynamic packages, logs and model assets are permanently deleted. Databases and account data stay untouched; the actual freed space depends on the scan. Close those apps first. This cannot be undone.";
 "cleaner.confirm_action" = "Clean Now";
 "cleaner.result_title" = "Cleanup Finished";
 "cleaner.result_message" = "Freed %@ by removing %lld files. %lld items or apps could not be cleaned.";

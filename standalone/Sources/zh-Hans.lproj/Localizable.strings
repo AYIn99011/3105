@@ -84,10 +84,10 @@
 
 "cleaner.title" = "清理";
 "cleaner.limited_mode" = "有限清理";
-"cleaner.available" = "可清理";
+"cleaner.available" = "应用占用";
 "cleaner.selected" = "已选择";
 "cleaner.selected_summary" = "%lld 个应用 · %@";
-"cleaner.scope_footer" = "只清理 Library/Caches 和 tmp。Documents、偏好设置和钥匙串保持不变。";
+"cleaner.scope_footer" = "按类型清理：逐个应用扫描内部，只删除可再生的缓存、动态包、日志与模型素材。数据库、账户配置、偏好设置和钥匙串保持不变。";
 "cleaner.apps_with_cache" = "%lld 个应用有临时数据";
 "cleaner.apps_footer" = "仅显示存在可清理临时数据的应用。";
 "cleaner.scanned_count" = "已扫描 %lld 个";
@@ -98,10 +98,10 @@
 "cleaner.empty_message" = "在 Library/Caches 或 tmp 中未发现可移除的数据。";
 "cleaner.selection_actions" = "选择操作";
 "cleaner.scan_again" = "重新扫描";
-"cleaner.clean_button" = "清理 %@";
+"cleaner.clean_button" = "按类型清理";
 "cleaner.cleaning" = "正在清理…";
-"cleaner.confirm_title" = "删除临时数据？";
-"cleaner.confirm_message" = "3105 将永久删除所选 %lld 个应用的 Library/Caches 和 tmp（%@）。请先关闭这些应用。下次打开时，重建缓存可能会使启动变慢。此操作无法撤销。";
+"cleaner.confirm_title" = "按类型清理？";
+"cleaner.confirm_message" = "将逐个扫描所选 %lld 个应用（当前共 %@），只永久删除按类型识别出的缓存、动态包、日志与模型素材；数据库、账户配置和其他文件不会动，实际释放以扫描结果为准。请先关闭这些应用。此操作无法撤销。";
 "cleaner.confirm_action" = "立即清理";
 "cleaner.result_title" = "清理完成";
 "cleaner.result_message" = "已释放 %@，删除 %lld 个文件。有 %lld 个项目或应用无法清理。";

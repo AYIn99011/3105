@@ -282,7 +282,7 @@ struct AppTypeCleanView: View {
     /// is recorded whole as .other, so no space silently disappears from
     /// the panel. tmp and Library/Caches stay transparent: their children
     /// are the units, never the directories themselves.
-    private static func scanGroups(containerPath: String) -> [TypeGroup] {
+    static func scanGroups(containerPath: String) -> [TypeGroup] {
         _ = ContainerStore.retainContainerAccess(containerPath)
         var units: [InventoryEntry] = []
         var visited = 0
@@ -324,6 +324,27 @@ struct AppTypeCleanView: View {
         return byType.values
             .filter { $0.itemCount > 0 || $0.totalBytes > 0 }
             .sorted { $0.type.sortRank < $1.type.sortRank }
+    }
+
+    /// Batch entry point used by the main list's clean action: scan one
+    /// container with the same classification as this panel and delete
+    /// only the types that are pre-selected there (regenerable caches,
+    /// dynamic packages, logs, model assets). Locked types and
+    /// unclassified content are never touched.
+    static func cleanDefaultTypes(containerPath: String)
+        -> (freedBytes: Int64, removedItemCount: Int, failedItemCount: Int) {
+        var freed: Int64 = 0
+        var removed = 0
+        var failed = 0
+        for group in scanGroups(containerPath: containerPath)
+        where group.type.defaultSelected && !group.type.isLocked {
+            let result = ContainerInventoryService.delete(
+                containerPath: containerPath, relativePaths: group.paths)
+            freed += result.freedBytes
+            removed += result.removedItemCount
+            failed += result.failedItemCount
+        }
+        return (freed, removed, failed)
     }
 
     // MARK: - Clean
