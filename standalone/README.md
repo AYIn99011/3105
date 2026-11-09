@@ -23,6 +23,7 @@
 - 只保留清理与日志两个页；仓库/壁纸/补丁等上游功能未带入
 - 未带 opa334 内核链（iOS 17/18 用，本机型不需要）；ContainerStore 里原内核门禁的一处调用已改为直接尝试扫描（无权限时自然空手而归）
 - Utils.swift 只保留 AppLog/log/AppInfo；更新检查等上游逻辑未带入
+- AppIconHelper（ObjC）原样带入：ContainerStore 的 appInfoForBundleID/installedAppInfo 是它提供的 C 函数（本沙盒里返回空，但链接必需）
 - ContainerStore 对 PatchPathValidator 的唯一一处调用（bundle ID 规范形校验）已等价内联为私有 helper，未带入补丁工程模型文件；ContainerIdentityResolver、FileBrowserMetadata 为其真实依赖，原样带入
 
 ## 注意
