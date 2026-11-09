@@ -224,6 +224,33 @@ enum ContainerInventoryService {
         }
     }
 
+    // MARK: - Whole-container size
+
+    /// Total bytes of every top-level entry (Documents, Library, tmp and
+    /// the rest), for the main list's size column.
+    static func measureContainer(containerPath: String) -> Int64? {
+        guard let rootDescriptor = openContainerRoot(containerPath) else { return nil }
+        defer { close(rootDescriptor) }
+        var total: Int64 = 0
+        forEachEntry(in: rootDescriptor) { name, information in
+            switch information.st_mode & S_IFMT {
+            case S_IFREG:
+                total += max(0, Int64(information.st_size))
+            case S_IFDIR:
+                let childDescriptor = name.withCString {
+                    openat(rootDescriptor, $0, O_RDONLY | O_DIRECTORY | O_CLOEXEC | O_NOFOLLOW)
+                }
+                if childDescriptor >= 0 {
+                    total += scanDirectory(childDescriptor).bytes
+                    close(childDescriptor)
+                }
+            default:
+                break
+            }
+        }
+        return total
+    }
+
     // MARK: - Deletion
 
     static func delete(

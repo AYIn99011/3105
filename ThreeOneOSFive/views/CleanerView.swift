@@ -34,7 +34,7 @@ struct CleanerView: View {
         return CleanerCatalog.sorted(
             matchingRecords,
             order: sortOrder,
-            size: { $0.usage.totalBytes },
+            size: { $0.displayBytes },
             displayName: { $0.app.displayName },
             stableID: { $0.id }
         )
@@ -49,12 +49,12 @@ struct CleanerView: View {
     }
 
     private var totalAvailableBytes: Int64 {
-        records.reduce(0) { $0 + $1.usage.totalBytes }
+        records.reduce(0) { $0 + $1.displayBytes }
     }
 
     private var selectedBytes: Int64 {
         records.reduce(0) { result, record in
-            result + (selectedBundleIDs.contains(record.id) ? record.usage.totalBytes : 0)
+            result + (selectedBundleIDs.contains(record.id) ? record.displayBytes : 0)
         }
     }
 
@@ -190,7 +190,7 @@ struct CleanerView: View {
                 if !isCleaning { toggleSelection(record.id) }
             }
 
-            Text(sizeText(record.usage.totalBytes))
+            Text(sizeText(record.displayBytes))
                 .font(.caption.monospacedDigit())
                 .foregroundStyle(.secondary)
                 .fixedSize()
@@ -232,7 +232,7 @@ struct CleanerView: View {
 
             Spacer(minLength: 8)
 
-            Text(sizeText(record.usage.totalBytes))
+            Text(sizeText(record.displayBytes))
                 .font(.caption.monospacedDigit())
                 .foregroundStyle(.secondary)
 
@@ -613,6 +613,7 @@ struct CleanerView: View {
             processedCount = scannedBundleIDs.count
             log("cleaner: filesystem direct records added=\(directAdded)")
             publish(force: true)
+            measureFullSizes(discoveredRecords, requestID: requestID)
 
             DispatchQueue.main.async {
                 guard scanID == requestID else { return }
@@ -625,6 +626,28 @@ struct CleanerView: View {
         }
     }
 
+    /// Progressive whole-container sizing: the list first appears with
+    /// cache/tmp figures, then each row's true footprint (Documents,
+    /// Library, everything) lands as it is measured.
+    private func measureFullSizes(_ snapshot: [CleanerAppRecord], requestID: Int) {
+        DispatchQueue.global(qos: .utility).async {
+            for record in snapshot {
+                guard let bytes = ContainerInventoryService.measureContainer(
+                    containerPath: record.app.containerPath
+                ) else {
+                    continue
+                }
+                DispatchQueue.main.async {
+                    guard scanID == requestID,
+                          let index = records.firstIndex(where: { $0.id == record.id }) else {
+                        return
+                    }
+                    records[index].fullBytes = bytes
+                }
+            }
+        }
+    }
+
     private func cleanSelectedApps() {
         guard !isBusy else { return }
         let selectedRecords = records.filter { selectedBundleIDs.contains($0.id) }
@@ -633,6 +656,7 @@ struct CleanerView: View {
 
         DispatchQueue.global(qos: .userInitiated).async {
             var updatedUsage: [String: LimitedCleanerUsage] = [:]
+            var freedByID: [String: Int64] = [:]
             var freedBytes: Int64 = 0
             var removedItems = 0
             var failedItems = 0
@@ -653,6 +677,7 @@ struct CleanerView: View {
                         rootValidator: { ContainerStore.isApplicationContainerPath($0.path) }
                     )
                     updatedUsage[record.id] = result.after
+                    freedByID[record.id] = result.freedBytes
                     freedBytes += result.freedBytes
                     removedItems += result.removedItemCount
                     failedItems += result.failedItemCount
@@ -674,14 +699,21 @@ struct CleanerView: View {
                 Int64(failedItems + unavailableApps)
             )
             DispatchQueue.main.async {
+                // An app whose cache hit zero still exists (its Documents
+                // did not shrink); keep it listed with the freed amount
+                // subtracted from its last full size until re-measured.
                 records = records.compactMap { record in
                     guard let usage = updatedUsage[record.id] else { return record }
-                    guard usage.totalBytes > 0 else { return nil }
-                    return CleanerAppRecord(app: record.app, usage: usage)
+                    var updated = CleanerAppRecord(app: record.app, usage: usage)
+                    if let full = record.fullBytes {
+                        updated.fullBytes = max(0, full - (freedByID[record.id] ?? 0))
+                    }
+                    return updated
                 }
                 selectedBundleIDs.removeAll()
                 isCleaning = false
                 activeAlert = .result(message: resultMessage)
+                measureFullSizes(records, requestID: scanID)
             }
         }
     }
@@ -694,8 +726,13 @@ struct CleanerView: View {
 private struct CleanerAppRecord: Identifiable {
     let app: InstalledApp
     let usage: LimitedCleanerUsage
+    var fullBytes: Int64?
 
     var id: String { app.bundleID }
+
+    /// What the list shows: the whole-container size once measured,
+    /// the cache/tmp figure until then.
+    var displayBytes: Int64 { fullBytes ?? usage.totalBytes }
 }
 
 private enum CleanerAlert: Identifiable {
