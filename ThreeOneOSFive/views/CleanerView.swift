@@ -135,13 +135,31 @@ struct CleanerView: View {
                 .padding(.vertical, 20)
             } else {
                 ForEach(filteredRecords) { record in
-                    Button {
-                        toggleSelection(record.id)
-                    } label: {
-                        applicationRow(record)
+                    HStack(spacing: 0) {
+                        Button {
+                            toggleSelection(record.id)
+                        } label: {
+                            applicationRow(record)
+                        }
+                        .buttonStyle(.plain)
+                        .disabled(isCleaning)
+
+                        if record.app.bundleID != "com.apple.mobile.MobileHouseArrest" {
+                            NavigationLink {
+                                CleanerAppInventoryRoot(
+                                    appName: record.app.displayName,
+                                    bundleID: record.app.bundleID,
+                                    containerPath: record.app.containerPath
+                                )
+                            } label: {
+                                Image(systemName: "chevron.right")
+                                    .font(.caption.weight(.semibold))
+                                    .foregroundStyle(.tertiary)
+                                    .frame(width: 26, height: 40)
+                            }
+                            .disabled(isCleaning)
+                        }
                     }
-                    .buttonStyle(.plain)
-                    .disabled(isCleaning)
                 }
             }
         } header: {
@@ -441,7 +459,8 @@ struct CleanerView: View {
         isScanning = true
         scannedAppCount = 0
         selectedBundleIDs.removeAll()
-        records.removeAll()
+        // The previous list stays visible until the new one is complete;
+        // publishing half-built snapshots made apps flicker in and out.
 
         DispatchQueue.global(qos: .userInitiated).async {
             var scannedBundleIDs = Set<String>()
@@ -449,11 +468,17 @@ struct CleanerView: View {
             var processedCount = 0
 
             func publish(force: Bool = false) {
-                guard force || processedCount.isMultiple(of: 8) else { return }
+                let count = processedCount
+                guard force else {
+                    DispatchQueue.main.async {
+                        guard scanID == requestID else { return }
+                        scannedAppCount = count
+                    }
+                    return
+                }
                 let snapshot = discoveredRecords.sorted {
                     $0.app.displayName.localizedCaseInsensitiveCompare($1.app.displayName) == .orderedAscending
                 }
-                let count = processedCount
                 DispatchQueue.main.async {
                     guard scanID == requestID else { return }
                     records = snapshot
@@ -531,10 +556,28 @@ struct CleanerView: View {
             }
             scanNewApps(mhaApps)
 
-            // Adaptation: the Cleaner never consumed the filesystem
-            // discovery chain, so on builds where LS/MCM enumeration is
-            // restricted it would see no third-party apps at all.
-            scanNewApps(ContainerStore.resolvedFilesystemApps())
+            // Adaptation: filesystem-resolved apps join directly with
+            // their retained grants. Routing them through the catalog's
+            // activation gate made the list unstable: the catalog marks a
+            // bundle ID as scanned before activating, so one flaky
+            // activation permanently hid the app for that scan.
+            var directAdded = 0
+            for app in ContainerStore.resolvedFilesystemApps() {
+                guard ContainerPresentationPolicy.shouldShow(bundleID: app.bundleID),
+                      !discoveredRecords.contains(where: { $0.id == app.bundleID }),
+                      let usage = try? LimitedCleanerService.scan(
+                          containerURL: URL(fileURLWithPath: app.containerPath, isDirectory: true),
+                          rootValidator: { ContainerStore.isApplicationContainerPath($0.path) }
+                      ),
+                      usage.totalBytes > 0 else {
+                    continue
+                }
+                discoveredRecords.append(CleanerAppRecord(app: app, usage: usage))
+                scannedBundleIDs.insert(app.bundleID)
+                directAdded += 1
+            }
+            processedCount = scannedBundleIDs.count
+            log("cleaner: filesystem direct records added=\(directAdded)")
             publish(force: true)
 
             DispatchQueue.main.async {

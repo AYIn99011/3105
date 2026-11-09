@@ -684,10 +684,41 @@ enum ContainerStore {
     private static func bundleIDFromPreferencesListing(containerPath: String) -> (bundleID: String?, entries: [String]) {
         let prefsPath = (containerPath as NSString).appendingPathComponent("Library/Preferences")
         let entries = (try? FileManager.default.contentsOfDirectory(atPath: prefsPath)) ?? []
+        return (preferencesCandidates(entries: entries).first, entries)
+    }
+
+    // All bundle-ID-shaped names in Library/Preferences, in a deterministic
+    // order (third-party IDs alphabetically, then com.apple IDs).
+    private static func preferencesCandidates(entries: [String]) -> [String] {
         let ids = entries.filter { $0.hasSuffix(".plist") }.map { String($0.dropLast(".plist".count)) }
             .filter { $0.contains(".") && !$0.contains(" ") }
-        let pick = ids.first { !$0.hasPrefix("com.apple.") } ?? ids.first
-        return (pick, entries)
+        return ids.sorted { a, b in
+            let aApple = a.hasPrefix("com.apple.")
+            let bApple = b.hasPrefix("com.apple.")
+            if aApple != bApple { return !aApple }
+            return a < b
+        }
+    }
+
+    private static func preferencesCandidateIDs(containerPath: String) -> [String] {
+        let prefsPath = (containerPath as NSString).appendingPathComponent("Library/Preferences")
+        let entries = (try? FileManager.default.contentsOfDirectory(atPath: prefsPath)) ?? []
+        return preferencesCandidates(entries: entries)
+    }
+
+    // Identity pinning: a candidate is the container's true bundle ID when
+    // the MCM path lookup for it resolves back to this very container.
+    private static func verifiedBundleID(candidates: [String], containerPath: String) -> String? {
+        for candidate in candidates.prefix(6) {
+            var lookupError: NSString?
+            guard let path = MCMContainerPathForIdentifier(2, candidate, false, &lookupError) else {
+                continue
+            }
+            if ContainerDiscoveryMerger.canonicalPath(path) == containerPath {
+                return candidate
+            }
+        }
+        return nil
     }
 
     static func resolvedFilesystemApps() -> [InstalledApp] {
@@ -708,6 +739,7 @@ enum ContainerStore {
         var failedCount = 0
         var metadataIdentifiedCount = 0
         var prefsIdentifiedCount = 0
+        var verifiedIdentifiedCount = 0
         for (index, dir) in dirs.enumerated() {
             let canonical = ContainerDiscoveryMerger.canonicalPath(dir)
             let sample = index < 5
@@ -724,11 +756,14 @@ enum ContainerStore {
             var bundleID = metadata?.bundleID.trimmingCharacters(in: .whitespacesAndNewlines) ?? ""
             var displayName = metadata?.displayName ?? ""
             if bundleID.isEmpty || bundleID.hasPrefix("systemgroup.") {
-                let (pick, _) = bundleIDFromPreferencesListing(containerPath: canonical)
+                let candidates = preferencesCandidateIDs(containerPath: canonical)
+                let verified = verifiedBundleID(candidates: candidates, containerPath: canonical)
+                let pick = verified ?? candidates.first
                 if let pick, !pick.hasPrefix("systemgroup.") {
                     bundleID = pick
                     displayName = ""
                     prefsIdentifiedCount += 1
+                    if verified != nil { verifiedIdentifiedCount += 1 }
                 }
             } else {
                 metadataIdentifiedCount += 1
@@ -754,7 +789,7 @@ enum ContainerStore {
                 icon: info["icon"] as? UIImage
             ))
         }
-        log("cleaner: filesystem resolve total=\(dirs.count) granted=\(grantedCount) identified=\(identifiedCount) (metadata=\(metadataIdentifiedCount) prefs=\(prefsIdentifiedCount)) failed=\(failedCount)")
+        log("cleaner: filesystem resolve total=\(dirs.count) granted=\(grantedCount) identified=\(identifiedCount) (metadata=\(metadataIdentifiedCount) prefs=\(prefsIdentifiedCount) verified=\(verifiedIdentifiedCount)) failed=\(failedCount)")
         return resolved
     }
 

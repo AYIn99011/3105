@@ -18,6 +18,8 @@
 		3105A210 /* mcm_bridge.m in Sources */ = {isa = PBXBuildFile; fileRef = 3105A030; };
 		3105C300 /* worse_query.m in Sources */ = {isa = PBXBuildFile; fileRef = 3105C301; };
 		3105C306 /* AppGroupDiscovery.swift in Sources */ = {isa = PBXBuildFile; fileRef = 3105C307; };
+		3105C311 /* ContainerInventoryService.swift in Sources */ = {isa = PBXBuildFile; fileRef = 3105C310; };
+		3105C313 /* CleanerAppDetailView.swift in Sources */ = {isa = PBXBuildFile; fileRef = 3105C312; };
 		3105A220 /* kexploit_opa334.m in Sources */ = {isa = PBXBuildFile; fileRef = 3105A080; };
 		3105A221 /* offsets.m in Sources */ = {isa = PBXBuildFile; fileRef = 3105A081; };
 		3105A222 /* krw.m in Sources */ = {isa = PBXBuildFile; fileRef = 3105A082; };
@@ -129,6 +131,8 @@
 		3105C301 /* worse_query.m */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.c.objc; path = worse_query.m; sourceTree = "<group>"; };
 		3105C304 /* worse_query.h */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.c.h; path = worse_query.h; sourceTree = "<group>"; };
 		3105C307 /* AppGroupDiscovery.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = AppGroupDiscovery.swift; sourceTree = "<group>"; };
+		3105C310 /* ContainerInventoryService.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = ContainerInventoryService.swift; sourceTree = "<group>"; };
+		3105C312 /* CleanerAppDetailView.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = CleanerAppDetailView.swift; sourceTree = "<group>"; };
 		3105C308 /* ThreeOneOSFive.entitlements */ = {isa = PBXFileReference; lastKnownFileType = text.plist.entitlements; path = ThreeOneOSFive.entitlements; sourceTree = "<group>"; };
 		3105B114 /* PatchProjectModels.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = PatchProjectModels.swift; sourceTree = "<group>"; };
 		3105B115 /* PatchPackageCodec.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = PatchPackageCodec.swift; sourceTree = "<group>"; };
@@ -246,6 +250,7 @@
 				3105B122 /* PatchProjectEditorView.swift */,
 				3105C102 /* FolderPatchSelectionView.swift */,
 				3105E101 /* CleanerView.swift */,
+				3105C312 /* CleanerAppDetailView.swift */,
 				3105F106 /* WallpaperLabView.swift */,
 				3105F108 /* OnboardingView.swift */,
 				3105L102 /* RepositoryMarketplaceView.swift */,
@@ -261,6 +266,7 @@
 				3105A099 /* Localization.swift */,
 				3105A104 /* ContainerStore.swift */,
 				3105C307 /* AppGroupDiscovery.swift */,
+				3105C310 /* ContainerInventoryService.swift */,
 				3105A108 /* ContainerIdentityResolver.swift */,
 				3105A109 /* ContainerBrowserLogic.swift */,
 				3105A110 /* FileReplacementService.swift */,
@@ -408,6 +414,8 @@
 				3105A208,
 				3105C300,
 				3105C306,
+				3105C311,
+				3105C313,
 				3105J200,
 				3105J204,
 				3105J206,
