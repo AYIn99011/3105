@@ -13,6 +13,11 @@ struct CleanerView: View {
     @State private var hasLoaded = false
     @State private var scanID = UUID()
     @State private var activeAlert: CleanerAlert?
+    // Determinate progress for whichever phase is running (usage scan,
+    // whole-container measuring, or cleaning); hidden when total is 0
+    // or done catches up.
+    @State private var progressDone = 0
+    @State private var progressTotal = 0
 
     private var filteredRecords: [CleanerAppRecord] {
         let matchingRecords: [CleanerAppRecord]
@@ -71,6 +76,10 @@ struct CleanerView: View {
                     clearLabel: language.text("common.clear")
                 )
                 Divider()
+                if progressTotal > 0, progressDone < progressTotal {
+                    ProgressView(value: Double(progressDone), total: Double(progressTotal))
+                        .progressViewStyle(.linear)
+                }
                 cleanerList
                     .listStyle(.insetGrouped)
             }
@@ -508,6 +517,11 @@ struct CleanerView: View {
             // rewrites the same group-container symlink.
             let jobs: [(app: InstalledApp, needsActivation: Bool)] =
                 activationCandidates.map { ($0, true) } + directApps.map { ($0, false) }
+            DispatchQueue.main.async {
+                guard scanID == requestID else { return }
+                progressTotal = jobs.count
+                progressDone = 0
+            }
             let collectLock = NSLock()
             var collected: [CleanerAppRecord] = []
             var flushedCount = 0
@@ -555,13 +569,17 @@ struct CleanerView: View {
                     flushedCount = collected.count
                 }
                 let processed = processedCount
+                let reportProgress = !batch.isEmpty || processed % 8 == 0
                 collectLock.unlock()
-                if !batch.isEmpty {
+                if reportProgress {
                     DispatchQueue.main.async {
                         guard scanID == requestID else { return }
-                        let known = Set(records.map(\.id))
-                        records.append(contentsOf: batch.filter { !known.contains($0.id) })
+                        if !batch.isEmpty {
+                            let known = Set(records.map(\.id))
+                            records.append(contentsOf: batch.filter { !known.contains($0.id) })
+                        }
                         scannedAppCount = processed
+                        progressDone = processed
                     }
                 }
             }
@@ -577,6 +595,7 @@ struct CleanerView: View {
                     records = finalRecords
                 }
                 scannedAppCount = finalProcessed
+                progressDone = finalProcessed
                 isScanning = false
                 log(
                     "cleaner: scan complete bundles=\(finalProcessed) " +
@@ -591,21 +610,37 @@ struct CleanerView: View {
     /// cache/tmp figures, then each row's true footprint (Documents,
     /// Library, everything) lands as it is measured.
     private func measureFullSizes(_ snapshot: [CleanerAppRecord], requestID: UUID) {
+        guard !snapshot.isEmpty else { return }
+        DispatchQueue.main.async {
+            guard scanID == requestID else { return }
+            progressTotal = snapshot.count
+            progressDone = 0
+        }
         DispatchQueue.global(qos: .utility).async {
+            let doneLock = NSLock()
+            var doneCount = 0
             DispatchQueue.concurrentPerform(iterations: snapshot.count) { index in
                 let record = snapshot[index]
-                guard let bytes = ContainerInventoryService.measureContainer(
+                let bytes = ContainerInventoryService.measureContainer(
                     containerPath: record.app.containerPath
-                ) else {
-                    return
-                }
+                )
+                doneLock.lock()
+                doneCount += 1
+                let done = doneCount
+                doneLock.unlock()
                 DispatchQueue.main.async {
-                    guard scanID == requestID,
-                          let index = records.firstIndex(where: { $0.id == record.id }) else {
-                        return
+                    guard scanID == requestID else { return }
+                    progressDone = done
+                    if let bytes,
+                       let rowIndex = records.firstIndex(where: { $0.id == record.id }) {
+                        records[rowIndex].fullBytes = bytes
                     }
-                    records[index].fullBytes = bytes
                 }
+            }
+            DispatchQueue.main.async {
+                guard scanID == requestID else { return }
+                progressTotal = 0
+                progressDone = 0
             }
         }
     }
@@ -659,6 +694,8 @@ struct CleanerView: View {
         let selectedRecords = records.filter { selectedBundleIDs.contains($0.id) }
         guard !selectedRecords.isEmpty else { return }
         isCleaning = true
+        progressTotal = selectedRecords.count
+        progressDone = 0
 
         DispatchQueue.global(qos: .userInitiated).async {
             var updatedUsage: [String: LimitedCleanerUsage] = [:]
@@ -669,6 +706,7 @@ struct CleanerView: View {
             var unavailableApps = 0
 
             for record in selectedRecords {
+                defer { DispatchQueue.main.async { progressDone += 1 } }
                 guard let containerPath = ContainerStore.resolveAppContainerPath(
                     bundleID: record.app.bundleID
                 ) else {
@@ -719,6 +757,8 @@ struct CleanerView: View {
                 selectedBundleIDs.removeAll()
                 isCleaning = false
                 activeAlert = .result(message: resultMessage)
+                progressTotal = 0
+                progressDone = 0
                 measureFullSizes(records, requestID: scanID)
             }
         }

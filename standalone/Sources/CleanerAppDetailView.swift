@@ -107,6 +107,12 @@ struct CleanerAppDetailView: View {
             }
         }
         .listStyle(.insetGrouped)
+        .safeAreaInset(edge: .top, spacing: 0) {
+            if !isLoading, !entries.isEmpty, measuredPaths.count < entries.count {
+                ProgressView(value: Double(measuredPaths.count), total: Double(entries.count))
+                    .progressViewStyle(.linear)
+            }
+        }
         .navigationTitle(title)
         .navigationBarTitleDisplayMode(.inline)
         .safeAreaInset(edge: .bottom) {
