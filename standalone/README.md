@@ -10,7 +10,7 @@
 2. 本目录执行 `xcodegen generate`，打开 `Qingsao.xcodeproj`
 3. 选 target Qingsao → Signing & Capabilities：
    - 勾 Automatically manage signing，Team 选你自己的开发者账号
-   - App Groups 里确认 `group.com.ayinjun.cleaner` 已注册（Xcode 一般自动建；报错就去开发者后台先建这个组再回来）
+   - App Groups 里确认 `group.com.apple.mobile.MobileHouseArrest` 已注册（Xcode 一般自动建；报错就去开发者后台先建这个组再回来）
 4. 连 iPhone（27.3 b1，**别升 b2/RSR**），Run
 
 ## 另一条签名路（不走 Xcode 直签时）
@@ -19,7 +19,7 @@
 
 ## 与 3105 分叉版的差异
 
-- 包名 com.ayinjun.cleaner、显示名「清扫」，不再顶 MobileHouseArrest 马甲（MCM 租约激活在 27.x 本来就是死的，不影响清理全链）
+- 包名 com.apple.mobile.MobileHouseArrest、显示名「清扫」。2026-11-09 实测定性：containermanagerd 的 class-2 路径查询认宿主 bundle ID——换成自有 ID（com.ayinjun.cleaner）后反查验证与字典探针整场 0 命中，prefs 里没写自身 ID 的 App（酷安/抖音/QQ音乐等）全部漏检，故拍板沿用 MobileHouseArrest 身份；安装会覆盖 3105 fork 版（同 ID，替代关系）。
 - 只保留清理与日志两个页；仓库/壁纸/补丁等上游功能未带入
 - 未带 opa334 内核链（iOS 17/18 用，本机型不需要）；ContainerStore 里原内核门禁的一处调用已改为直接尝试扫描（无权限时自然空手而归）
 - Utils.swift 只保留 AppLog/log/AppInfo；更新检查等上游逻辑未带入

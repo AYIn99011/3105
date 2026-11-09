@@ -6,12 +6,11 @@ options:
   createIntermediateGroups: true
 settings:
   base:
-    PRODUCT_BUNDLE_IDENTIFIER: com.ayinjun.cleaner
+    PRODUCT_BUNDLE_IDENTIFIER: com.apple.mobile.MobileHouseArrest
     MARKETING_VERSION: "1.0"
     CURRENT_PROJECT_VERSION: "1"
     SWIFT_VERSION: "5.0"
     TARGETED_DEVICE_FAMILY: "1"
-    ASSETCATALOG_COMPILER_APPICON_NAME: ""
 targets:
   Qingsao:
     type: application
@@ -22,6 +21,5 @@ targets:
       base:
         INFOPLIST_FILE: Sources/Info.plist
         GENERATE_INFOPLIST_FILE: "NO"
-        ASSETCATALOG_COMPILER_APPICON_NAME: ""
         SWIFT_OBJC_BRIDGING_HEADER: Sources/Qingsao-Bridging-Header.h
         CODE_SIGN_ENTITLEMENTS: Sources/Qingsao.entitlements

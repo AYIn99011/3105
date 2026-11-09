@@ -16,6 +16,7 @@ struct CleanerView: View {
     // Determinate progress for whichever phase is running (usage scan,
     // whole-container measuring, or cleaning); hidden when total is 0
     // or done catches up.
+    @State private var typePanelApp: InstalledApp?
     @State private var progressDone = 0
     @State private var progressTotal = 0
 
@@ -88,6 +89,9 @@ struct CleanerView: View {
             .scrollDismissesKeyboard(.interactively)
             .toolbar { toolbarContent }
             .alert(item: $activeAlert, content: alert(for:))
+            .sheet(item: $typePanelApp) { app in
+                AppTypeCleanView(app: app)
+            }
             .onAppear {
                 if !hasLoaded {
                     hasLoaded = true
@@ -226,6 +230,14 @@ struct CleanerView: View {
                     .fixedSize()
             }
             .padding(.vertical, 2)
+        }
+        .contextMenu {
+            Button {
+                typePanelApp = record.app
+            } label: {
+                Label("按类型清理", systemImage: "folder.badge.minus")
+            }
+            .disabled(isCleaning || record.app.bundleID == (Bundle.main.bundleIdentifier ?? ""))
         }
     }
 
