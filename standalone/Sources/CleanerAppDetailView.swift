@@ -8,7 +8,37 @@ final class CleanerInventoryModel: ObservableObject {
     @Published var selectedPaths = Set<String>()
     @Published var unlockedPaths = Set<String>()
     var entrySizes: [String: Int64] = [:]
+    var entryCounts: [String: Int] = [:]
     var defaultsApplied = Set<String>()
+    private var grantEnsured = false
+
+    /// The root view's onAppear fires again every time the user pops
+    /// back to it; the container grant only needs one successful
+    /// retain per inventory session.
+    func ensureGrant() {
+        guard !grantEnsured else { return }
+        grantEnsured = true
+        let path = containerPath
+        DispatchQueue.global(qos: .userInitiated).async { [weak self] in
+            if !ContainerStore.retainContainerAccess(path) {
+                DispatchQueue.main.async { self?.grantEnsured = false }
+            }
+        }
+    }
+
+    /// After a deletion, drop the cached sizes of the deleted paths,
+    /// everything under them, and every ancestor (their totals
+    /// changed). All other entries keep their cached sizes, so
+    /// navigating back never re-measures a level that did not change.
+    func invalidateSizes(forPaths paths: [String]) {
+        for path in paths {
+            for key in Array(entrySizes.keys)
+            where key == path || key.hasPrefix(path + "/") || path.hasPrefix(key + "/") {
+                entrySizes.removeValue(forKey: key)
+                entryCounts.removeValue(forKey: key)
+            }
+        }
+    }
 
     init(containerPath: String) {
         self.containerPath = containerPath
@@ -49,11 +79,9 @@ struct CleanerAppInventoryRoot: View {
         )
         .onAppear {
             // Make sure the worse_query grant for this container is held
-            // before any listing or deletion happens below.
-            let path = containerPath
-            DispatchQueue.global(qos: .userInitiated).async {
-                _ = ContainerStore.retainContainerAccess(path)
-            }
+            // before any listing or deletion happens below. The model
+            // deduplicates: reappearing after a pop does not re-grant.
+            model.ensureGrant()
         }
     }
 }
@@ -67,6 +95,7 @@ struct CleanerAppDetailView: View {
     @State private var entries: [InventoryEntry] = []
     @State private var measuredPaths = Set<String>()
     @State private var isLoading = true
+    @State private var loadGeneration = 0
     @State private var pendingUnlock: InventoryEntry?
     @State private var pendingBatch: BatchKind?
     @State private var resultMessage: String?
@@ -314,6 +343,8 @@ struct CleanerAppDetailView: View {
     }
 
     private func loadLevel() {
+        loadGeneration += 1
+        let generation = loadGeneration
         isLoading = true
         measuredPaths = []
         let containerPath = model.containerPath
@@ -326,19 +357,44 @@ struct CleanerAppDetailView: View {
                 relativePath: level
             )
             DispatchQueue.main.async {
+                guard loadGeneration == generation else { return }
                 entries = shallow
                 isLoading = false
+                // Sizes measured earlier in this inventory session are
+                // cached on the model: reappearing on a level (popping
+                // back from a deeper level, switching tabs) reuses them
+                // and measures only what is missing or was invalidated
+                // by a deletion -- no level is ever re-measured whole.
+                var pending: [InventoryEntry] = []
                 for entry in shallow {
                     if !entry.isDirectory {
                         measuredPaths.insert(entry.relativePath)
                         model.entrySizes[entry.relativePath] = entry.bytes
+                        model.entryCounts[entry.relativePath] = entry.itemCount
+                    } else if let cachedBytes = model.entrySizes[entry.relativePath] {
+                        if let rowIndex = entries.firstIndex(where: { $0.id == entry.id }) {
+                            entries[rowIndex].bytes = cachedBytes
+                            entries[rowIndex].itemCount = model.entryCounts[entry.relativePath] ?? entry.itemCount
+                        }
+                        measuredPaths.insert(entry.relativePath)
+                    } else {
+                        pending.append(entry)
                     }
                     applyDefaultSelection(entry)
                 }
+                if pending.isEmpty {
+                    sortEntries()
+                } else {
+                    measurePending(pending, containerPath: containerPath, generation: generation)
+                }
             }
-            let directories = shallow.filter { $0.isDirectory }
-            DispatchQueue.concurrentPerform(iterations: directories.count) { index in
-                let entry = directories[index]
+        }
+    }
+
+    private func measurePending(_ pending: [InventoryEntry], containerPath: String, generation: Int) {
+        DispatchQueue.global(qos: .userInitiated).async {
+            DispatchQueue.concurrentPerform(iterations: pending.count) { index in
+                let entry = pending[index]
                 guard let measured = ContainerInventoryService.measureEntry(
                     containerPath: containerPath,
                     relativePath: entry.relativePath
@@ -346,20 +402,27 @@ struct CleanerAppDetailView: View {
                     return
                 }
                 DispatchQueue.main.async {
+                    guard loadGeneration == generation else { return }
                     if let rowIndex = entries.firstIndex(where: { $0.id == entry.id }) {
                         entries[rowIndex].bytes = measured.bytes
                         entries[rowIndex].itemCount = measured.itemCount
                     }
                     measuredPaths.insert(entry.relativePath)
                     model.entrySizes[entry.relativePath] = measured.bytes
+                    model.entryCounts[entry.relativePath] = measured.itemCount
                 }
             }
             DispatchQueue.main.async {
-                entries.sort {
-                    if $0.bytes != $1.bytes { return $0.bytes > $1.bytes }
-                    return $0.name.localizedCaseInsensitiveCompare($1.name) == .orderedAscending
-                }
+                guard loadGeneration == generation else { return }
+                sortEntries()
             }
+        }
+    }
+
+    private func sortEntries() {
+        entries.sort {
+            if $0.bytes != $1.bytes { return $0.bytes > $1.bytes }
+            return $0.name.localizedCaseInsensitiveCompare($1.name) == .orderedAscending
         }
     }
 
@@ -393,6 +456,7 @@ struct CleanerAppDetailView: View {
                 // The main list cannot observe this deletion; mark the
                 // app dirty so its row is re-measured when it reappears.
                 CleanerRefreshCenter.shared.markDirty(bundleID: bundleID)
+                model.invalidateSizes(forPaths: paths)
                 loadLevel()
             }
         }
