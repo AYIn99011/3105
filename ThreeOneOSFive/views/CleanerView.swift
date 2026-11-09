@@ -135,31 +135,7 @@ struct CleanerView: View {
                 .padding(.vertical, 20)
             } else {
                 ForEach(filteredRecords) { record in
-                    HStack(spacing: 0) {
-                        Button {
-                            toggleSelection(record.id)
-                        } label: {
-                            applicationRow(record)
-                        }
-                        .buttonStyle(.plain)
-                        .disabled(isCleaning)
-
-                        if record.app.bundleID != "com.apple.mobile.MobileHouseArrest" {
-                            NavigationLink {
-                                CleanerAppInventoryRoot(
-                                    appName: record.app.displayName,
-                                    bundleID: record.app.bundleID,
-                                    containerPath: record.app.containerPath
-                                )
-                            } label: {
-                                Image(systemName: "chevron.right")
-                                    .font(.caption.weight(.semibold))
-                                    .foregroundStyle(.tertiary)
-                                    .frame(width: 26, height: 40)
-                            }
-                            .disabled(isCleaning)
-                        }
-                    }
+                    cleanerRow(record)
                 }
             }
         } header: {
@@ -180,6 +156,62 @@ struct CleanerView: View {
                 Text(language.text("cleaner.apps_footer"))
             }
         }
+    }
+
+    private func cleanerRow(_ record: CleanerAppRecord) -> some View {
+        HStack(spacing: 10) {
+            Button {
+                toggleSelection(record.id)
+            } label: {
+                Image(systemName: selectedBundleIDs.contains(record.id) ? "checkmark.circle.fill" : "circle")
+                    .font(.system(size: AppTheme.selectionIconSize, weight: .medium))
+                    .foregroundStyle(selectedBundleIDs.contains(record.id) ? AppTheme.accent : Color.secondary)
+                    .frame(width: 30, height: 40)
+            }
+            .buttonStyle(.plain)
+            .disabled(isCleaning)
+
+            BrowserAppIcon(app: record.app)
+
+            VStack(alignment: .leading, spacing: 2) {
+                Text(record.app.displayName)
+                    .font(.subheadline.weight(.semibold))
+                    .foregroundStyle(.primary)
+                    .lineLimit(1)
+                Text(record.app.bundleID)
+                    .font(.caption2.monospaced())
+                    .foregroundStyle(.secondary)
+                    .lineLimit(1)
+                    .truncationMode(.middle)
+            }
+            .frame(maxWidth: .infinity, alignment: .leading)
+            .contentShape(Rectangle())
+            .onTapGesture {
+                if !isCleaning { toggleSelection(record.id) }
+            }
+
+            Text(sizeText(record.usage.totalBytes))
+                .font(.caption.monospacedDigit())
+                .foregroundStyle(.secondary)
+                .fixedSize()
+
+            if record.app.bundleID != "com.apple.mobile.MobileHouseArrest" {
+                NavigationLink {
+                    CleanerAppInventoryRoot(
+                        appName: record.app.displayName,
+                        bundleID: record.app.bundleID,
+                        containerPath: record.app.containerPath
+                    )
+                } label: {
+                    Image(systemName: "chevron.right")
+                        .font(.caption.weight(.semibold))
+                        .foregroundStyle(.tertiary)
+                        .frame(width: 24, height: 40)
+                }
+                .disabled(isCleaning)
+            }
+        }
+        .padding(.vertical, 2)
     }
 
     private func applicationRow(_ record: CleanerAppRecord) -> some View {

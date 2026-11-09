@@ -706,10 +706,38 @@ enum ContainerStore {
         return preferencesCandidates(entries: entries)
     }
 
+    // Identity candidates from Library/Saved Application State: the system
+    // names those directories "<bundleID>.savedState", a much stronger
+    // signal than the preference-file soup.
+    private static func savedStateCandidateIDs(containerPath: String) -> [String] {
+        let statePath = ((containerPath as NSString)
+            .appendingPathComponent("Library/Saved Application State"))
+        let entries = (try? FileManager.default.contentsOfDirectory(atPath: statePath)) ?? []
+        return entries
+            .filter { $0.hasSuffix(".savedState") }
+            .map { String($0.dropLast(".savedState".count)) }
+            .filter { $0.contains(".") && !$0.contains(" ") }
+    }
+
+    private static func identityCandidates(containerPath: String) -> [String] {
+        var seen = Set<String>()
+        var ordered: [String] = []
+        for candidate in savedStateCandidateIDs(containerPath: containerPath)
+            + preferencesCandidateIDs(containerPath: containerPath) {
+            if seen.insert(candidate).inserted {
+                ordered.append(candidate)
+            }
+        }
+        return ordered
+    }
+
     // Identity pinning: a candidate is the container's true bundle ID when
     // the MCM path lookup for it resolves back to this very container.
+    // Verification is definitive, so try generously: busy containers (the
+    // ByteDance/Tencent apps) carry dozens of SDK preference files and the
+    // true ID is rarely among the first few alphabetically.
     private static func verifiedBundleID(candidates: [String], containerPath: String) -> String? {
-        for candidate in candidates.prefix(6) {
+        for candidate in candidates.prefix(40) {
             var lookupError: NSString?
             guard let path = MCMContainerPathForIdentifier(2, candidate, false, &lookupError) else {
                 continue
@@ -740,6 +768,9 @@ enum ContainerStore {
         var metadataIdentifiedCount = 0
         var prefsIdentifiedCount = 0
         var verifiedIdentifiedCount = 0
+        var unresolvedLogged = 0
+        var resolvedIndexByBundleID: [String: Int] = [:]
+        var resolvedVerified: [String: Bool] = [:]
         for (index, dir) in dirs.enumerated() {
             let canonical = ContainerDiscoveryMerger.canonicalPath(dir)
             let sample = index < 5
@@ -755,18 +786,24 @@ enum ContainerStore {
             let metadata = readContainerMetadata(containerPath: canonical)
             var bundleID = metadata?.bundleID.trimmingCharacters(in: .whitespacesAndNewlines) ?? ""
             var displayName = metadata?.displayName ?? ""
+            var identityVerified = false
             if bundleID.isEmpty || bundleID.hasPrefix("systemgroup.") {
-                let candidates = preferencesCandidateIDs(containerPath: canonical)
+                let candidates = identityCandidates(containerPath: canonical)
                 let verified = verifiedBundleID(candidates: candidates, containerPath: canonical)
                 let pick = verified ?? candidates.first
                 if let pick, !pick.hasPrefix("systemgroup.") {
                     bundleID = pick
                     displayName = ""
+                    identityVerified = verified != nil
                     prefsIdentifiedCount += 1
                     if verified != nil { verifiedIdentifiedCount += 1 }
+                } else if !candidates.isEmpty, unresolvedLogged < 8 {
+                    unresolvedLogged += 1
+                    log("cleaner: identity unresolved container=\(canonical) candidates=\(Array(candidates.prefix(8)))")
                 }
             } else {
                 metadataIdentifiedCount += 1
+                identityVerified = true
             }
             guard !bundleID.isEmpty, !bundleID.hasPrefix("systemgroup.") else {
                 if sample {
@@ -781,13 +818,26 @@ enum ContainerStore {
                 log("cleaner grant sample[\(index)]: \(bundleID) granted + identified")
             }
             let info = appInfoForBundleID(bundleID) as? [String: Any] ?? [:]
-            resolved.append(InstalledApp(
+            let app = InstalledApp(
                 bundleID: bundleID,
                 name: displayName.isEmpty ? bundleID : displayName,
                 containerPath: canonical,
                 version: info["version"] as? String ?? "",
                 icon: info["icon"] as? UIImage
-            ))
+            )
+            // Two containers can claim one ID (an app and its extension).
+            // A verified identity replaces an unverified one; otherwise the
+            // first claim wins.
+            if let existingIndex = resolvedIndexByBundleID[bundleID] {
+                if identityVerified, resolvedVerified[bundleID] != true {
+                    resolved[existingIndex] = app
+                    resolvedVerified[bundleID] = true
+                }
+            } else {
+                resolvedIndexByBundleID[bundleID] = resolved.count
+                resolvedVerified[bundleID] = identityVerified
+                resolved.append(app)
+            }
         }
         log("cleaner: filesystem resolve total=\(dirs.count) granted=\(grantedCount) identified=\(identifiedCount) (metadata=\(metadataIdentifiedCount) prefs=\(prefsIdentifiedCount) verified=\(verifiedIdentifiedCount)) failed=\(failedCount)")
         return resolved
