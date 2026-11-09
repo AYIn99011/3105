@@ -1,0 +1,50 @@
+name: Build unsigned IPA
+
+on:
+  workflow_dispatch:
+  push:
+    branches:
+      - test/ios27.3-support
+
+jobs:
+  build:
+    runs-on: macos-15
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Select latest Xcode
+        run: |
+          ls /Applications | grep -i xcode || true
+          sudo xcode-select -s /Applications/Xcode.app/Contents/Developer
+          xcodebuild -version
+
+      - name: Build (unsigned, iphoneos)
+        run: |
+          xcodebuild build \
+            -project ThreeOneOSFive.xcodeproj \
+            -target ThreeOneOSFive \
+            -configuration Release \
+            -sdk iphoneos \
+            CODE_SIGNING_ALLOWED=NO \
+            CODE_SIGNING_REQUIRED=NO \
+            CODE_SIGN_IDENTITY="" \
+            SYMROOT="$PWD/build"
+
+      - name: Package IPA
+        run: |
+          APP_PATH=$(find build -name "*.app" -maxdepth 4 | head -1)
+          echo "App: $APP_PATH"
+          test -n "$APP_PATH"
+          rm -rf Payload 3105-unsigned.ipa
+          mkdir Payload
+          cp -R "$APP_PATH" Payload/
+          zip -qry 3105-unsigned.ipa Payload
+          ls -lh 3105-unsigned.ipa
+
+      - name: Upload artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: 3105-unsigned-ipa
+          path: 3105-unsigned.ipa
+          if-no-files-found: error
