@@ -614,6 +614,51 @@ enum ContainerStore {
     /// resolved from each container's MCM metadata plist, read under a
     /// worse_query grant. Unresolved containers keep their fallback
     /// (UUID) identity and are filtered out by presentation policy.
+    // One-shot deep probe (first container only): separates the two
+    // alt_flags variants and reports whether post-grant reads actually
+    // work — fopen errno, byte count, plist keys, directory entries.
+    private static func probeContainerAccess(containerPath: String) {
+        guard let group = AppGroupDiscovery.workingGroupIdentifier() else {
+            log("probe: no accessible app group")
+            return
+        }
+        let metadataPath = metadataPath(for: containerPath)
+        for alt in [true, false] {
+            let handle = worse_query(containerPath, group, alt, true)
+            guard handle >= 0 else {
+                log("probe: alt=\(alt) grant -> \(handle)")
+                continue
+            }
+            if let fd = fopen(metadataPath, "r") {
+                var total = 0
+                var buffer = [UInt8](repeating: 0, count: 8192)
+                var bytes: [UInt8] = []
+                while true {
+                    let n = fread(&buffer, 1, buffer.count, fd)
+                    if n <= 0 { break }
+                    total += n
+                    if bytes.count < 1_000_000 { bytes.append(contentsOf: buffer[0..<n]) }
+                }
+                fclose(fd)
+                var keys = "unparsed"
+                if let plist = try? PropertyListSerialization.propertyList(from: Data(bytes), options: [], format: nil) as? [String: Any] {
+                    keys = plist.keys.sorted().joined(separator: ",")
+                }
+                log("probe: alt=\(alt) metadata read ok bytes=\(total) keys=[\(keys)]")
+            } else {
+                log("probe: alt=\(alt) metadata fopen failed errno=\(errno) \(String(cString: strerror(errno)))")
+            }
+            var entryCount = -1
+            if let dir = opendir(containerPath) {
+                entryCount = 0
+                while readdir(dir) != nil { entryCount += 1 }
+                closedir(dir)
+            }
+            log("probe: alt=\(alt) opendir entries=\(entryCount)")
+            worse_query_release(handle)
+        }
+    }
+
     static func resolvedFilesystemApps() -> [InstalledApp] {
         // Adaptation: root-level traversal grants are refused by the kernel
         // on iOS 27.3 (worse_query -6), so enumerate the container UUIDs via
@@ -622,6 +667,9 @@ enum ContainerStore {
         // Cleaner can scan (and later clean) through them.
         let dirs = enumerateDirectories(path: appDataRoot).filter {
             UUID(uuidString: ($0 as NSString).lastPathComponent) != nil
+        }
+        if let first = dirs.first {
+            probeContainerAccess(containerPath: ContainerDiscoveryMerger.canonicalPath(first))
         }
         var resolved: [InstalledApp] = []
         var grantedCount = 0
