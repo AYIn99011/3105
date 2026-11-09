@@ -630,7 +630,7 @@ struct CleanerView: View {
     /// Progressive whole-container sizing: the list first appears with
     /// cache/tmp figures, then each row's true footprint (Documents,
     /// Library, everything) lands as it is measured.
-    private func measureFullSizes(_ snapshot: [CleanerAppRecord], requestID: Int) {
+    private func measureFullSizes(_ snapshot: [CleanerAppRecord], requestID: UUID) {
         DispatchQueue.global(qos: .utility).async {
             for record in snapshot {
                 guard let bytes = ContainerInventoryService.measureContainer(
