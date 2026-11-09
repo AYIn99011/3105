@@ -34,6 +34,10 @@ enum ExploitSupportPolicy {
         return false
     }
 
+    // Adaptation (worse_query line): iOS 27.3 beta 1 is verified on device
+    // via the MCM lease / worse_query access paths, not the kernel exploit.
+    static let verifiedIOS27_3Builds: [String] = ["24C5037i"]
+
     static func isSupported(major: Int, minor: Int, patch: Int, build: String) -> Bool {
         if supportsKernelExploit(major: major, minor: minor, patch: patch) {
             return true
@@ -42,6 +46,10 @@ enum ExploitSupportPolicy {
         if major == 26 {
             guard minor >= 0, patch >= 0 else { return false }
             return minor < 6 || (minor == 6 && patch <= 1)
+        }
+
+        if major == 27, minor == 3, patch == 0 {
+            return verifiedIOS27_3Builds.contains(build)
         }
 
         guard major == 27, minor == 0, patch == 0 else { return false }

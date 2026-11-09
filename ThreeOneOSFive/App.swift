@@ -148,6 +148,11 @@ class AppState: ObservableObject {
     }
 
     private func maybeAutoRunKernelExploit() {
+        // Adaptation safety guard: the opa334 kernel chain targets iOS 17/18.
+        // On iOS 26+ access comes from the MCM lease / container-query
+        // grants, so never auto-run the kernel exploit there; the sandbox
+        // probe result from refreshKernelExploitStatus() stands as-is.
+        guard ProcessInfo.processInfo.operatingSystemVersion.majorVersion < 26 else { return }
         guard !kernelExploitRunning,
               !exploitStatus.isSuccess,
               !exploitStatus.isFailed,
