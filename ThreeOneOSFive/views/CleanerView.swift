@@ -483,13 +483,7 @@ struct CleanerView: View {
                         ContainerPresentationPolicy.shouldShow(bundleID: $0)
                     },
                     activateContainer: { application in
-                    var activationError: NSString?
-                        return MCMActivateContainerPath(
-                        2,
-                            application.bundleID,
-                        false,
-                        &activationError
-                        )
+                        ContainerStore.resolveAppContainerPath(bundleID: application.bundleID)
                     },
                     isValidContainerPath: ContainerStore.isApplicationContainerPath,
                     usageForContainer: { containerPath in
@@ -536,6 +530,11 @@ struct CleanerView: View {
                 scanNewApps(progressiveApps)
             }
             scanNewApps(mhaApps)
+
+            // Adaptation: the Cleaner never consumed the filesystem
+            // discovery chain, so on builds where LS/MCM enumeration is
+            // restricted it would see no third-party apps at all.
+            scanNewApps(ContainerStore.resolvedFilesystemApps())
             publish(force: true)
 
             DispatchQueue.main.async {

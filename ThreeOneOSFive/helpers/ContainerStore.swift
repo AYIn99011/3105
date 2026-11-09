@@ -103,11 +103,23 @@ enum ContainerStore {
         let detail = lookupError.map(String.init) ?? "unavailable"
         log("patch: MHA-C2 could not resolve \(bundleID), detail=\(detail)")
 
+        // Adaptation: on builds where MCM hands out no sandbox tokens,
+        // resolve the path with the ungated MCM lookup and open it with a
+        // retained worse_query grant instead.
+        var pathError: NSString?
+        if let path = MCMContainerPathForIdentifier(2, bundleID, false, &pathError),
+           isApplicationContainerPath(path),
+           retainContainerAccess(path) {
+            log("patch: worse_query grant resolved \(bundleID) -> \(path)")
+            return path
+        }
+
         // Fallback for iOS builds where MCM refuses to hand out sandbox
         // tokens (e.g. iOS 18.1.x): scan the app-data root with the inode
         // walk and read each container's MCM metadata plist directly. The
         // raw reads only succeed when the sandbox escape is active.
         if let scanned = resolveAppContainerPathByMetadataScan(bundleID: bundleID) {
+            _ = retainContainerAccess(scanned)
             log("patch: filesystem metadata scan resolved \(bundleID)")
             return scanned
         }
@@ -298,7 +310,7 @@ enum ContainerStore {
     ) -> [ApplicationBundleMetadata] {
         let handle = grantContainerAccess(rootPath)
         defer {
-            if handle >= 0 { bad_query_release(handle) }
+            if handle >= 0 { worse_query_release(handle) }
         }
 
         let fileManager = FileManager.default
@@ -404,7 +416,7 @@ enum ContainerStore {
                 }
             }
             defer {
-                if handle >= 0 { bad_query_release(handle) }
+                if handle >= 0 { worse_query_release(handle) }
             }
 
             let names = (try? FileManager.default.contentsOfDirectory(atPath: cachePath)) ?? []
@@ -475,7 +487,7 @@ enum ContainerStore {
 
         let handle = grantContainerAccess(path)
         if handle >= 0 {
-            defer { bad_query_release(handle) }
+            defer { worse_query_release(handle) }
             if let names = try? FileManager.default.contentsOfDirectory(atPath: path), !names.isEmpty {
                 return names.map { (path as NSString).appendingPathComponent($0) }
             }
@@ -522,11 +534,47 @@ enum ContainerStore {
         )
     }
 
+    // Adaptation: the bad_query container-query traversal was patched in
+    // iOS 27 beta 5. Grants now come from worse_query (same containermanager
+    // family, driven through an App Group the app owns). alt_flags is tried
+    // in the upstream PoC's order (true, then false).
     static func grantContainerAccess(_ containerPath: String) -> Int64 {
         guard shouldUseBadQuery else { return -1 }
+        guard let group = AppGroupDiscovery.workingGroupIdentifier() else {
+            log("grant: no accessible app group; cannot grant \(containerPath)")
+            return -2
+        }
         let clean = containerPath.hasSuffix("/") ? String(containerPath.dropLast()) : containerPath
-        var pathC = clean.utf8CString.map { Int8($0) }
-        return bad_query(&pathC, true, nil, false)
+        var handle = worse_query(clean as NSString, group as NSString, true, true)
+        if handle < 0 {
+            handle = worse_query(clean as NSString, group as NSString, false, true)
+        }
+        if handle < 0 {
+            log("grant: worse_query failed for \(clean) -> \(handle)")
+        }
+        return handle
+    }
+
+    // MARK: Retained grants (Cleaner)
+
+    private static var retainedGrantHandles: [String: Int64] = [:]
+    private static let retainedGrantLock = NSLock()
+
+    /// Grants access to a container and keeps the extension alive for the
+    /// rest of the process, mirroring the MCM lease registry. Returns true
+    /// when access to the path is held.
+    static func retainContainerAccess(_ containerPath: String) -> Bool {
+        let clean = ContainerDiscoveryMerger.canonicalPath(containerPath)
+        retainedGrantLock.lock()
+        let alreadyHeld = retainedGrantHandles[clean] != nil
+        retainedGrantLock.unlock()
+        if alreadyHeld { return true }
+        let handle = grantContainerAccess(clean)
+        guard handle >= 0 else { return false }
+        retainedGrantLock.lock()
+        retainedGrantHandles[clean] = handle
+        retainedGrantLock.unlock()
+        return true
     }
 
     static func containersFromFilesystem() -> [InstalledApp] {
@@ -553,6 +601,36 @@ enum ContainerStore {
         }
         log("browser: filesystem accepted \(apps.count)/\(dirs.count) app containers")
         return apps
+    }
+
+    /// Adaptation: filesystem-discovered containers with identities
+    /// resolved from each container's MCM metadata plist, read under a
+    /// worse_query grant. Unresolved containers keep their fallback
+    /// (UUID) identity and are filtered out by presentation policy.
+    static func resolvedFilesystemApps() -> [InstalledApp] {
+        containersFromFilesystem().map { app in
+            switch ContainerIdentityResolver.resolve(
+                containerPath: app.containerPath,
+                grantAccess: grantContainerAccess,
+                releaseAccess: worse_query_release,
+                loadMetadata: readContainerMetadata
+            ) {
+            case .resolved(let metadata):
+                let info = appInfoForBundleID(metadata.bundleID) as? [String: Any] ?? [:]
+                return InstalledApp(
+                    bundleID: metadata.bundleID,
+                    name: metadata.displayName.isEmpty ? metadata.bundleID : metadata.displayName,
+                    containerPath: app.containerPath,
+                    version: info["version"] as? String ?? "",
+                    icon: info["icon"] as? UIImage
+                )
+            case .accessFailed(let code):
+                log("browser: identity resolve grant failed \(app.containerPath) -> \(code)")
+                return app
+            case .metadataUnavailable, .unsupportedIdentifier:
+                return app
+            }
+        }
     }
 
     static func inferredApp(
@@ -585,7 +663,7 @@ enum ContainerStore {
 
         let handle = grantContainerAccess(fallback.containerPath)
         defer {
-            if handle >= 0 { bad_query_release(handle) }
+            if handle >= 0 { worse_query_release(handle) }
         }
 
         let libraryPath = (fallback.containerPath as NSString).appendingPathComponent("Library")
