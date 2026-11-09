@@ -617,64 +617,6 @@ enum ContainerStore {
     // One-shot deep probe (first container only): separates the two
     // alt_flags variants and reports whether post-grant reads actually
     // work — fopen errno, byte count, plist keys, directory entries.
-    private static func probeContainerAccess(containerPath: String) {
-        guard let group = AppGroupDiscovery.workingGroupIdentifier() else {
-            log("probe: no accessible app group")
-            return
-        }
-        let metadataPath = metadataPath(for: containerPath)
-        for alt in [true, false] {
-            let handle = worse_query(containerPath, group, alt, true)
-            guard handle >= 0 else {
-                log("probe: alt=\(alt) grant -> \(handle)")
-                continue
-            }
-            if let fd = fopen(metadataPath, "r") {
-                var total = 0
-                var buffer = [UInt8](repeating: 0, count: 8192)
-                var bytes: [UInt8] = []
-                while true {
-                    let n = fread(&buffer, 1, buffer.count, fd)
-                    if n <= 0 { break }
-                    total += n
-                    if bytes.count < 1_000_000 { bytes.append(contentsOf: buffer[0..<n]) }
-                }
-                fclose(fd)
-                var keys = "unparsed"
-                if let plist = try? PropertyListSerialization.propertyList(from: Data(bytes), options: [], format: nil) as? [String: Any] {
-                    keys = plist.keys.sorted().joined(separator: ",")
-                }
-                log("probe: alt=\(alt) metadata read ok bytes=\(total) keys=[\(keys)]")
-            } else {
-                log("probe: alt=\(alt) metadata fopen failed errno=\(errno) \(String(cString: strerror(errno)))")
-            }
-            var entryCount = -1
-            if let dir = opendir(containerPath) {
-                entryCount = 0
-                while readdir(dir) != nil { entryCount += 1 }
-                closedir(dir)
-            }
-            log("probe: alt=\(alt) opendir entries=\(entryCount)")
-            var st = stat()
-            if stat(metadataPath, &st) == 0 {
-                log("probe: alt=\(alt) metadata stat size=\(st.st_size) flags=0x\(String(st.st_flags, radix: 16)) mode=0o\(String(st.st_mode, radix: 8))")
-            } else {
-                log("probe: alt=\(alt) metadata stat failed errno=\(errno)")
-            }
-            let (prefsPick, prefsEntries) = bundleIDFromPreferencesListing(containerPath: containerPath)
-            log("probe: alt=\(alt) prefs entries=\(prefsEntries.prefix(8)) pick=\(prefsPick ?? "nil")")
-            if let pick = prefsPick {
-                let prefsFile = ((containerPath as NSString).appendingPathComponent("Library/Preferences") as NSString).appendingPathComponent(pick + ".plist")
-                if let fd = fopen(prefsFile, "r") {
-                    fclose(fd)
-                    log("probe: alt=\(alt) prefs fopen ok")
-                } else {
-                    log("probe: alt=\(alt) prefs fopen failed errno=\(errno)")
-                }
-            }
-            worse_query_release(handle)
-        }
-    }
 
     // Identity fallback: the container metadata plist sits behind a
     // stricter protection than the container itself (post-grant opendir
@@ -749,79 +691,6 @@ enum ContainerStore {
         return nil
     }
 
-    // MARK: - Display names from bundle containers
-
-    /// Friendly names live in each app bundle's Info.plist. The bundle
-    /// container for a known bundle ID is a class-1 MCM path lookup (path
-    /// lookups are not gated by the sandbox-token check), then a plain
-    /// read, with a worse_query grant as fallback. Enumerating the bundle
-    /// tree by inode walk found almost nothing, so look up directly.
-    static func bundleDisplayNames(for bundleIDs: [String]) -> [String: String] {
-        var map: [String: String] = [:]
-        var grantedReads = 0
-        for bundleID in bundleIDs {
-            var lookupError: NSString?
-            guard let path = MCMContainerPathForIdentifier(1, bundleID, false, &lookupError) else {
-                continue
-            }
-            let canonical = ContainerDiscoveryMerger.canonicalPath(path)
-            if let pair = readBundleIdentity(containerPath: canonical), pair.bundleID == bundleID {
-                map[bundleID] = pair.name
-                continue
-            }
-            let handle = grantContainerAccess(canonical, logFailure: false)
-            guard handle >= 0 else { continue }
-            if let pair = readBundleIdentity(containerPath: canonical), pair.bundleID == bundleID {
-                map[bundleID] = pair.name
-                grantedReads += 1
-            }
-            worse_query_release(handle)
-        }
-        log("cleaner: bundle names requested=\(bundleIDs.count) mapped=\(map.count) grantedReads=\(grantedReads)")
-        return map
-    }
-
-    private static func readBundleIdentity(
-        containerPath: String
-    ) -> (bundleID: String, name: String)? {
-        guard let entries = try? FileManager.default.contentsOfDirectory(atPath: containerPath),
-              let appDir = entries.first(where: { $0.hasSuffix(".app") }) else {
-            return nil
-        }
-        let appPath = (containerPath as NSString).appendingPathComponent(appDir)
-        let plistPath = (appPath as NSString).appendingPathComponent("Info.plist")
-        guard let data = try? Data(contentsOf: URL(fileURLWithPath: plistPath)),
-              let plist = try? PropertyListSerialization.propertyList(
-                  from: data, options: [], format: nil
-              ) as? [String: Any],
-              let bundleID = plist["CFBundleIdentifier"] as? String,
-              !bundleID.isEmpty else {
-            return nil
-        }
-        // Localized display name wins: zh-Hans first, then any Chinese, then English.
-        let lprojPreference = ["zh-Hans.lproj", "zh_CN.lproj", "zh-Hant.lproj", "en.lproj"]
-        var localized: String?
-        for lproj in lprojPreference {
-            let stringsPath = ((appPath as NSString)
-                .appendingPathComponent(lproj) as NSString)
-                .appendingPathComponent("InfoPlist.strings")
-            if let stringsData = try? Data(contentsOf: URL(fileURLWithPath: stringsPath)),
-               let strings = try? PropertyListSerialization.propertyList(
-                   from: stringsData, options: [], format: nil
-               ) as? [String: Any],
-               let value = strings["CFBundleDisplayName"] as? String,
-               !value.isEmpty {
-                localized = value
-                break
-            }
-        }
-        let name = localized
-            ?? (plist["CFBundleDisplayName"] as? String)
-            ?? (plist["CFBundleName"] as? String)
-            ?? bundleID
-        return (bundleID, name)
-    }
-
     static func resolvedFilesystemApps() -> [InstalledApp] {
         // Adaptation: root-level traversal grants are refused by the kernel
         // on iOS 27.3 (worse_query -6), so enumerate the container UUIDs via
@@ -831,9 +700,6 @@ enum ContainerStore {
         let dirs = enumerateDirectories(path: appDataRoot).filter {
             UUID(uuidString: ($0 as NSString).lastPathComponent) != nil
         }
-        if let first = dirs.first {
-            probeContainerAccess(containerPath: ContainerDiscoveryMerger.canonicalPath(first))
-        }
         var resolved: [InstalledApp] = []
         var grantedCount = 0
         var identifiedCount = 0
@@ -842,6 +708,9 @@ enum ContainerStore {
         var prefsIdentifiedCount = 0
         var verifiedIdentifiedCount = 0
         var unresolvedLogged = 0
+        var unclaimedPaths: [String] = []
+        var unidentifiedLogged = 0
+        var resolvedIndexByPath: [String: Int] = [:]
         var resolvedIndexByBundleID: [String: Int] = [:]
         var resolvedVerified: [String: Bool] = [:]
         for (index, dir) in dirs.enumerated() {
@@ -882,6 +751,11 @@ enum ContainerStore {
                 if sample {
                     log("cleaner grant sample[\(index)]: granted, identity unavailable \(canonical)")
                 }
+                unclaimedPaths.append(canonical)
+                if unidentifiedLogged < 12 {
+                    unidentifiedLogged += 1
+                    log("cleaner: unidentified \(canonical) candidates=\(identityCandidates(containerPath: canonical).count)")
+                }
                 worse_query_release(handle)
                 continue
             }
@@ -908,23 +782,78 @@ enum ContainerStore {
                 }
             } else {
                 resolvedIndexByBundleID[bundleID] = resolved.count
+                resolvedIndexByPath[canonical] = resolved.count
                 resolvedVerified[bundleID] = identityVerified
                 resolved.append(app)
             }
         }
         log("cleaner: filesystem resolve total=\(dirs.count) granted=\(grantedCount) identified=\(identifiedCount) (metadata=\(metadataIdentifiedCount) prefs=\(prefsIdentifiedCount) verified=\(verifiedIdentifiedCount)) failed=\(failedCount)")
-        let friendlyNames = bundleDisplayNames(for: resolved.map(\.bundleID))
-        if !friendlyNames.isEmpty {
-            resolved = resolved.map { app in
-                guard let friendly = friendlyNames[app.bundleID] else { return app }
-                return InstalledApp(
-                    bundleID: app.bundleID,
-                    name: friendly,
-                    containerPath: app.containerPath,
-                    version: app.version,
-                    icon: app.icon
-                )
+
+        // Dictionary probing: apps whose local Preferences are empty
+        // (their defaults live in an App Group suite) never produce
+        // identity candidates. Ask containermanagerd for the container
+        // path of every known bundle ID that is still unresolved; its
+        // answer is authoritative, and the name table is the dictionary.
+        var probeHits = 0
+        let unclaimedSet = Set(unclaimedPaths)
+        for (bundleID, friendlyName) in KnownApps.table where resolvedIndexByBundleID[bundleID] == nil {
+            var lookupError: NSString?
+            guard let path = MCMContainerPathForIdentifier(2, bundleID, false, &lookupError) else {
+                continue
             }
+            let canonical = ContainerDiscoveryMerger.canonicalPath(path)
+            let info = appInfoForBundleID(bundleID) as? [String: Any] ?? [:]
+            let probedApp = InstalledApp(
+                bundleID: bundleID,
+                name: friendlyName,
+                containerPath: canonical,
+                version: info["version"] as? String ?? "",
+                icon: info["icon"] as? UIImage
+            )
+            if let claimedIndex = resolvedIndexByPath[canonical] {
+                // Already listed under a heuristic identity; the
+                // containermanagerd answer replaces it. A verified
+                // identity is never displaced.
+                guard resolvedVerified[resolved[claimedIndex].bundleID] != true else { continue }
+                let oldID = resolved[claimedIndex].bundleID
+                resolvedIndexByBundleID.removeValue(forKey: oldID)
+                resolvedVerified.removeValue(forKey: oldID)
+                resolved[claimedIndex] = probedApp
+                resolvedIndexByBundleID[bundleID] = claimedIndex
+                resolvedVerified[bundleID] = true
+                probeHits += 1
+                log("cleaner: probe hit \(bundleID) reclaimed from \(oldID)")
+                continue
+            }
+            let enumerated = unclaimedSet.contains(canonical)
+            if !enumerated, !FileManager.default.fileExists(atPath: canonical) {
+                continue
+            }
+            let probeHandle = grantContainerAccess(canonical, logFailure: false)
+            guard probeHandle >= 0 else { continue }
+            registerRetainedGrant(handle: probeHandle, for: canonical)
+            resolvedIndexByPath[canonical] = resolved.count
+            resolvedIndexByBundleID[bundleID] = resolved.count
+            resolvedVerified[bundleID] = true
+            resolved.append(probedApp)
+            probeHits += 1
+            log("cleaner: probe hit \(bundleID) enumerated=\(enumerated)")
+        }
+        if probeHits > 0 {
+            log("cleaner: dictionary probe hits=\(probeHits)")
+        }
+
+        // Friendly names from the built-in table; bundle containers are
+        // unreachable in this sandbox (see KnownApps).
+        resolved = resolved.map { app in
+            guard let friendly = KnownApps.displayName(for: app.bundleID) else { return app }
+            return InstalledApp(
+                bundleID: app.bundleID,
+                name: friendly,
+                containerPath: app.containerPath,
+                version: app.version,
+                icon: app.icon
+            )
         }
         return resolved
     }
