@@ -80,9 +80,14 @@ struct CleanerView: View {
             .toolbar { toolbarContent }
             .alert(item: $activeAlert, content: alert(for:))
             .onAppear {
-                guard !hasLoaded else { return }
-                hasLoaded = true
-                reload()
+                if !hasLoaded {
+                    hasLoaded = true
+                    reload()
+                } else {
+                    // Returning from a detail page: patch only the rows
+                    // whose containers had deletions, in place.
+                    refreshDirtyContainers()
+                }
             }
         }
     }
@@ -457,86 +462,27 @@ struct CleanerView: View {
         isScanning = true
         scannedAppCount = 0
         selectedBundleIDs.removeAll()
-        // The previous list stays visible until the new one is complete;
-        // publishing half-built snapshots made apps flicker in and out.
+        // On a rescan the previous list stays visible until the new one
+        // is complete (atomic swap at the end); on first load records
+        // stream in in batches as the parallel scan produces them.
+        let streamIn = records.isEmpty
 
         DispatchQueue.global(qos: .userInitiated).async {
-            var scannedBundleIDs = Set<String>()
-            var discoveredRecords: [CleanerAppRecord] = []
-            var processedCount = 0
-
-            func publish(force: Bool = false) {
-                let count = processedCount
-                guard force else {
-                    DispatchQueue.main.async {
-                        guard scanID == requestID else { return }
-                        scannedAppCount = count
-                    }
-                    return
-                }
-                let snapshot = discoveredRecords.sorted {
-                    $0.app.displayName.localizedCaseInsensitiveCompare($1.app.displayName) == .orderedAscending
-                }
-                DispatchQueue.main.async {
-                    guard scanID == requestID else { return }
-                    records = snapshot
-                    scannedAppCount = count
+            // Phase 1 (serial): collect candidates from every source.
+            // API/MCM/MHA apps still need activation during the scan;
+            // filesystem-resolved apps arrive with grants and paths.
+            var activationCandidates: [InstalledApp] = []
+            var directApps: [InstalledApp] = []
+            var seenIDs = Set<String>()
+            func collect(_ apps: [InstalledApp], into list: inout [InstalledApp]) {
+                for app in apps where seenIDs.insert(app.bundleID).inserted {
+                    list.append(app)
                 }
             }
-
-            func scanNewApps(_ applications: [InstalledApp]) {
-                let metadata = Dictionary(
-                    applications.map {
-                        ($0.bundleID, $0)
-                    },
-                    uniquingKeysWith: { first, _ in first }
-                )
-                let catalogApplications = applications.map {
-                    CleanerResolvedApplication(
-                        bundleID: $0.bundleID,
-                        name: $0.name,
-                        containerPath: $0.containerPath,
-                        version: $0.version
-                    )
-                }
-                let newRecords = CleanerCatalog.scanNewApplications(
-                    catalogApplications,
-                    scannedBundleIDs: &scannedBundleIDs,
-                    shouldIncludeBundleID: {
-                        ContainerPresentationPolicy.shouldShow(bundleID: $0)
-                    },
-                    activateContainer: { application in
-                        ContainerStore.resolveAppContainerPath(bundleID: application.bundleID)
-                    },
-                    isValidContainerPath: ContainerStore.isApplicationContainerPath,
-                    usageForContainer: { containerPath in
-                        try? LimitedCleanerService.scan(
-                            containerURL: URL(fileURLWithPath: containerPath, isDirectory: true),
-                            rootValidator: { ContainerStore.isApplicationContainerPath($0.path) }
-                        )
-                    }
-                )
-                processedCount = scannedBundleIDs.count
-                for record in newRecords {
-                    let original = metadata[record.bundleID]
-                    let resolvedApp = InstalledApp(
-                        bundleID: record.bundleID,
-                        name: record.application.name,
-                        containerPath: record.containerPath,
-                        version: record.application.version,
-                        icon: original?.icon
-                    )
-                    discoveredRecords.append(
-                        CleanerAppRecord(app: resolvedApp, usage: record.usage)
-                    )
-                }
-                publish()
-            }
-
             let apiApps = ContainerStore.installedAppsFromAPI()
             let dynamicIdentifiers = ContainerStore.dynamicAppIdentifiers()
             let mcmApps = ContainerStore.installedAppsFromMCM(identifiers: dynamicIdentifiers)
-            scanNewApps(apiApps + mcmApps)
+            collect(apiApps + mcmApps, into: &activationCandidates)
 
             let launchServicesIdentifiers = ContainerStore.launchServicesStoreIdentifiers()
             let candidates = MHAIdentifierCatalog.identifiers(
@@ -549,45 +495,94 @@ struct CleanerView: View {
             log("cleaner: resolving \(candidates.count) MHA-C2 bundle candidates")
             let mhaApps = ContainerStore.installedAppsFromMHACandidates(
                 identifiers: candidates
-            ) { progressiveApps in
-                scanNewApps(progressiveApps)
-            }
-            scanNewApps(mhaApps)
+            ) { _ in }
+            collect(mhaApps, into: &activationCandidates)
 
-            // Adaptation: filesystem-resolved apps join directly with
-            // their retained grants. Routing them through the catalog's
-            // activation gate made the list unstable: the catalog marks a
-            // bundle ID as scanned before activating, so one flaky
-            // activation permanently hid the app for that scan.
-            var directAdded = 0
-            for app in ContainerStore.resolvedFilesystemApps() {
-                guard ContainerPresentationPolicy.shouldShow(bundleID: app.bundleID),
-                      !discoveredRecords.contains(where: { $0.id == app.bundleID }),
-                      let usage = try? LimitedCleanerService.scan(
-                          containerURL: URL(fileURLWithPath: app.containerPath, isDirectory: true),
-                          rootValidator: { ContainerStore.isApplicationContainerPath($0.path) }
-                      ) else {
-                    continue
+            collect(ContainerStore.resolvedFilesystemApps(), into: &directApps)
+            log("cleaner: filesystem direct records added=\(directApps.count)")
+
+            // Phase 2 (parallel): activation + cache/tmp usage scan.
+            // The filesystem walks dominate the wall time and fan out;
+            // worse_query grants stay serialized inside
+            // ContainerStore.grantContainerAccess, because every grant
+            // rewrites the same group-container symlink.
+            let jobs: [(app: InstalledApp, needsActivation: Bool)] =
+                activationCandidates.map { ($0, true) } + directApps.map { ($0, false) }
+            let collectLock = NSLock()
+            var collected: [CleanerAppRecord] = []
+            var flushedCount = 0
+            var processedCount = 0
+            DispatchQueue.concurrentPerform(iterations: jobs.count) { index in
+                let job = jobs[index]
+                var record: CleanerAppRecord?
+                if ContainerPresentationPolicy.shouldShow(bundleID: job.app.bundleID) {
+                    let containerPath: String?
+                    if job.needsActivation {
+                        if let resolved = ContainerStore.resolveAppContainerPath(bundleID: job.app.bundleID),
+                           ContainerStore.isApplicationContainerPath(resolved) {
+                            containerPath = resolved
+                        } else {
+                            containerPath = nil
+                        }
+                    } else {
+                        containerPath = job.app.containerPath
+                    }
+                    if let containerPath,
+                       let usage = try? LimitedCleanerService.scan(
+                           containerURL: URL(fileURLWithPath: containerPath, isDirectory: true),
+                           rootValidator: { ContainerStore.isApplicationContainerPath($0.path) }
+                       ) {
+                        record = CleanerAppRecord(
+                            app: InstalledApp(
+                                bundleID: job.app.bundleID,
+                                name: job.app.name,
+                                containerPath: containerPath,
+                                version: job.app.version,
+                                icon: job.app.icon
+                            ),
+                            usage: usage
+                        )
+                    }
                 }
-                // Zero cache/tmp usage must not hide the app: the big
-                // chat/video apps keep their bulk in Documents and other
-                // Library folders, which the inventory now covers.
-                discoveredRecords.append(CleanerAppRecord(app: app, usage: usage))
-                scannedBundleIDs.insert(app.bundleID)
-                directAdded += 1
+                collectLock.lock()
+                processedCount += 1
+                if let record {
+                    collected.append(record)
+                }
+                var batch: [CleanerAppRecord] = []
+                if streamIn, collected.count - flushedCount >= 16 {
+                    batch = Array(collected[flushedCount...])
+                    flushedCount = collected.count
+                }
+                let processed = processedCount
+                collectLock.unlock()
+                if !batch.isEmpty {
+                    DispatchQueue.main.async {
+                        guard scanID == requestID else { return }
+                        let known = Set(records.map(\.id))
+                        records.append(contentsOf: batch.filter { !known.contains($0.id) })
+                        scannedAppCount = processed
+                    }
+                }
             }
-            processedCount = scannedBundleIDs.count
-            log("cleaner: filesystem direct records added=\(directAdded)")
-            publish(force: true)
-            measureFullSizes(discoveredRecords, requestID: requestID)
 
+            let finalRecords = collected
+            let finalProcessed = processedCount
             DispatchQueue.main.async {
                 guard scanID == requestID else { return }
+                if streamIn {
+                    let known = Set(records.map(\.id))
+                    records.append(contentsOf: finalRecords.filter { !known.contains($0.id) })
+                } else {
+                    records = finalRecords
+                }
+                scannedAppCount = finalProcessed
                 isScanning = false
                 log(
-                    "cleaner: scan complete bundles=\(processedCount) " +
-                        "reclaimableApps=\(discoveredRecords.count)"
+                    "cleaner: scan complete bundles=\(finalProcessed) " +
+                        "reclaimableApps=\(finalRecords.count)"
                 )
+                measureFullSizes(finalRecords, requestID: requestID)
             }
         }
     }
@@ -597,11 +592,12 @@ struct CleanerView: View {
     /// Library, everything) lands as it is measured.
     private func measureFullSizes(_ snapshot: [CleanerAppRecord], requestID: UUID) {
         DispatchQueue.global(qos: .utility).async {
-            for record in snapshot {
+            DispatchQueue.concurrentPerform(iterations: snapshot.count) { index in
+                let record = snapshot[index]
                 guard let bytes = ContainerInventoryService.measureContainer(
                     containerPath: record.app.containerPath
                 ) else {
-                    continue
+                    return
                 }
                 DispatchQueue.main.async {
                     guard scanID == requestID,
@@ -609,6 +605,50 @@ struct CleanerView: View {
                         return
                     }
                     records[index].fullBytes = bytes
+                }
+            }
+        }
+    }
+
+    /// Detail pages delete through ContainerInventoryService, which this
+    /// list cannot observe; they mark their bundle ID in
+    /// CleanerRefreshCenter instead. When the list reappears, only the
+    /// marked containers are re-scanned and re-measured (in parallel)
+    /// and their rows are patched in place -- no stale sizes, no full
+    /// rescan.
+    private func refreshDirtyContainers() {
+        let dirty = CleanerRefreshCenter.shared.consumeDirty()
+        guard !dirty.isEmpty else { return }
+        if isBusy {
+            // A running clean patches its own rows when it lands; put
+            // the marks back so they are not lost. A running scan
+            // publishes a fresh snapshot anyway, so marks can drop.
+            if isCleaning {
+                dirty.forEach { CleanerRefreshCenter.shared.markDirty(bundleID: $0) }
+            }
+            return
+        }
+        let targets = records.filter { dirty.contains($0.id) }
+        guard !targets.isEmpty else { return }
+        DispatchQueue.global(qos: .userInitiated).async {
+            DispatchQueue.concurrentPerform(iterations: targets.count) { index in
+                let target = targets[index]
+                let usage = try? LimitedCleanerService.scan(
+                    containerURL: URL(fileURLWithPath: target.app.containerPath, isDirectory: true),
+                    rootValidator: { ContainerStore.isApplicationContainerPath($0.path) }
+                )
+                let full = ContainerInventoryService.measureContainer(
+                    containerPath: target.app.containerPath
+                )
+                DispatchQueue.main.async {
+                    guard let rowIndex = records.firstIndex(where: { $0.id == target.id }) else { return }
+                    if let usage {
+                        var updated = CleanerAppRecord(app: target.app, usage: usage)
+                        updated.fullBytes = full ?? records[rowIndex].fullBytes
+                        records[rowIndex] = updated
+                    } else if let full {
+                        records[rowIndex].fullBytes = full
+                    }
                 }
             }
         }

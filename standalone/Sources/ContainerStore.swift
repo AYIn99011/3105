@@ -575,10 +575,15 @@ enum ContainerStore {
             return -2
         }
         let clean = containerPath.hasSuffix("/") ? String(containerPath.dropLast()) : containerPath
+        // Every worse_query call rewrites the same symlink inside the
+        // group container (its Library/Caches), so grants must never
+        // overlap even when callers fan out in parallel.
+        grantLock.lock()
         var handle = worse_query(clean, group, false, true)
         if handle < 0 {
             handle = worse_query(clean, group, true, true)
         }
+        grantLock.unlock()
         if handle < 0 && logFailure {
             log("grant: worse_query failed for \(clean) -> \(handle)")
         }
@@ -596,6 +601,7 @@ enum ContainerStore {
 
     private static var retainedGrantHandles: [String: Int64] = [:]
     private static let retainedGrantLock = NSLock()
+    private static let grantLock = NSLock()
 
     /// Grants access to a container and keeps the extension alive for the
     /// rest of the process, mirroring the MCM lease registry. Returns true
@@ -708,7 +714,13 @@ enum ContainerStore {
     // Verification is definitive, so try generously: busy containers (the
     // ByteDance/Tencent apps) carry dozens of SDK preference files and the
     // true ID is rarely among the first few alphabetically.
+    private static let mcmLookupLock = NSLock()
+
     private static func verifiedBundleID(candidates: [String], containerPath: String) -> String? {
+        // Identity workers call this in parallel; the MCM lookups are
+        // short XPC trips and stay serialized, one verification at a time.
+        mcmLookupLock.lock()
+        defer { mcmLookupLock.unlock() }
         for candidate in candidates.prefix(40) {
             var lookupError: NSString?
             guard let path = MCMContainerPathForIdentifier(2, candidate, false, &lookupError) else {
@@ -721,19 +733,75 @@ enum ContainerStore {
         return nil
     }
 
+    private struct FilesystemIdentity {
+        let metadataBundleID: String
+        let metadataName: String
+        let candidates: [String]
+        let verified: String?
+    }
+
     static func resolvedFilesystemApps() -> [InstalledApp] {
         // Adaptation: root-level traversal grants are refused by the kernel
         // on iOS 27.3 (worse_query -6), so enumerate the container UUIDs via
-        // the inode walk and grant each concrete container path on its own —
+        // the inode walk and grant each concrete container path on its own --
         // the shape worse_query was proven with. Grants stay retained so the
         // Cleaner can scan (and later clean) through them.
         let dirs = enumerateDirectories(path: appDataRoot).filter {
             UUID(uuidString: ($0 as NSString).lastPathComponent) != nil
         }
-        var resolved: [InstalledApp] = []
-        var grantedCount = 0
-        var identifiedCount = 0
+
+        // Phase A (serial): grants. Every worse_query call rewrites the
+        // same symlink inside the group container, so grants can never
+        // overlap; grantContainerAccess serializes them internally too.
+        var grantedPaths: [String] = []
+        var handlesByPath: [String: Int64] = [:]
         var failedCount = 0
+        for (index, dir) in dirs.enumerated() {
+            let canonical = ContainerDiscoveryMerger.canonicalPath(dir)
+            let handle = grantContainerAccess(canonical, logFailure: index < 5)
+            guard handle >= 0 else {
+                failedCount += 1
+                if index < 5 {
+                    log("cleaner grant sample[\(index)]: \(canonical) -> \(handle)")
+                }
+                continue
+            }
+            grantedPaths.append(canonical)
+            handlesByPath[canonical] = handle
+        }
+        let grantedCount = grantedPaths.count
+
+        // Phase B (parallel): once a grant is held, identity is plain
+        // file I/O (metadata read, preference listings) and fans out.
+        // MCM verification lookups stay serialized inside
+        // verifiedBundleID; the listings dominate the wall time.
+        let identityLock = NSLock()
+        var identities: [String: FilesystemIdentity] = [:]
+        DispatchQueue.concurrentPerform(iterations: grantedPaths.count) { index in
+            let path = grantedPaths[index]
+            let metadata = readContainerMetadata(containerPath: path)
+            let metadataID = metadata?.bundleID.trimmingCharacters(in: .whitespacesAndNewlines) ?? ""
+            var candidates: [String] = []
+            var verified: String?
+            if metadataID.isEmpty || metadataID.hasPrefix("systemgroup.") {
+                candidates = identityCandidates(containerPath: path)
+                verified = verifiedBundleID(candidates: candidates, containerPath: path)
+            }
+            let identity = FilesystemIdentity(
+                metadataBundleID: metadataID,
+                metadataName: metadata?.displayName ?? "",
+                candidates: candidates,
+                verified: verified
+            )
+            identityLock.lock()
+            identities[path] = identity
+            identityLock.unlock()
+        }
+
+        // Phase C (serial): claim rules unchanged -- a verified identity
+        // replaces an unverified one, otherwise the first claim wins.
+        var resolved: [InstalledApp] = []
+        var identifiedCount = 0
         var metadataIdentifiedCount = 0
         var prefsIdentifiedCount = 0
         var verifiedIdentifiedCount = 0
@@ -743,55 +811,42 @@ enum ContainerStore {
         var resolvedIndexByPath: [String: Int] = [:]
         var resolvedIndexByBundleID: [String: Int] = [:]
         var resolvedVerified: [String: Bool] = [:]
-        for (index, dir) in dirs.enumerated() {
-            let canonical = ContainerDiscoveryMerger.canonicalPath(dir)
-            let sample = index < 5
-            let handle = grantContainerAccess(canonical, logFailure: sample)
-            guard handle >= 0 else {
-                failedCount += 1
-                if sample {
-                    log("cleaner grant sample[\(index)]: \(canonical) -> \(handle)")
-                }
+        for (index, canonical) in grantedPaths.enumerated() {
+            guard let identity = identities[canonical],
+                  let handle = handlesByPath[canonical] else {
                 continue
             }
-            grantedCount += 1
-            let metadata = readContainerMetadata(containerPath: canonical)
-            var bundleID = metadata?.bundleID.trimmingCharacters(in: .whitespacesAndNewlines) ?? ""
-            var displayName = metadata?.displayName ?? ""
+            var bundleID = identity.metadataBundleID
+            var displayName = identity.metadataName
             var identityVerified = false
             if bundleID.isEmpty || bundleID.hasPrefix("systemgroup.") {
-                let candidates = identityCandidates(containerPath: canonical)
-                let verified = verifiedBundleID(candidates: candidates, containerPath: canonical)
-                let pick = verified ?? candidates.first
+                let pick = identity.verified ?? identity.candidates.first
                 if let pick, !pick.hasPrefix("systemgroup.") {
                     bundleID = pick
                     displayName = ""
-                    identityVerified = verified != nil
+                    identityVerified = identity.verified != nil
                     prefsIdentifiedCount += 1
-                    if verified != nil { verifiedIdentifiedCount += 1 }
-                } else if !candidates.isEmpty, unresolvedLogged < 8 {
+                    if identity.verified != nil { verifiedIdentifiedCount += 1 }
+                } else if !identity.candidates.isEmpty, unresolvedLogged < 8 {
                     unresolvedLogged += 1
-                    log("cleaner: identity unresolved container=\(canonical) candidates=\(Array(candidates.prefix(8)))")
+                    log("cleaner: identity unresolved container=\(canonical) candidates=\(Array(identity.candidates.prefix(8)))")
                 }
             } else {
                 metadataIdentifiedCount += 1
                 identityVerified = true
             }
             guard !bundleID.isEmpty, !bundleID.hasPrefix("systemgroup.") else {
-                if sample {
-                    log("cleaner grant sample[\(index)]: granted, identity unavailable \(canonical)")
-                }
                 unclaimedPaths.append(canonical)
                 if unidentifiedLogged < 12 {
                     unidentifiedLogged += 1
-                    log("cleaner: unidentified \(canonical) candidates=\(identityCandidates(containerPath: canonical).count)")
+                    log("cleaner: unidentified \(canonical) candidates=\(identity.candidates.count)")
                 }
                 worse_query_release(handle)
                 continue
             }
             registerRetainedGrant(handle: handle, for: canonical)
             identifiedCount += 1
-            if sample {
+            if index < 5 {
                 log("cleaner grant sample[\(index)]: \(bundleID) granted + identified")
             }
             let info = appInfoForBundleID(bundleID) as? [String: Any] ?? [:]

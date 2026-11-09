@@ -330,17 +330,19 @@ struct CleanerAppDetailView: View {
                     applyDefaultSelection(entry)
                 }
             }
-            for entry in shallow where entry.isDirectory {
+            let directories = shallow.filter { $0.isDirectory }
+            DispatchQueue.concurrentPerform(iterations: directories.count) { index in
+                let entry = directories[index]
                 guard let measured = ContainerInventoryService.measureEntry(
                     containerPath: containerPath,
                     relativePath: entry.relativePath
                 ) else {
-                    continue
+                    return
                 }
                 DispatchQueue.main.async {
-                    if let index = entries.firstIndex(where: { $0.id == entry.id }) {
-                        entries[index].bytes = measured.bytes
-                        entries[index].itemCount = measured.itemCount
+                    if let rowIndex = entries.firstIndex(where: { $0.id == entry.id }) {
+                        entries[rowIndex].bytes = measured.bytes
+                        entries[rowIndex].itemCount = measured.itemCount
                     }
                     measuredPaths.insert(entry.relativePath)
                     model.entrySizes[entry.relativePath] = measured.bytes
@@ -382,6 +384,9 @@ struct CleanerAppDetailView: View {
                     model.selectedPaths.remove(path)
                 }
                 resultMessage = "已释放 \(sizeText(result.freedBytes))，删除 \(result.removedItemCount) 个文件，失败 \(result.failedItemCount) 个。"
+                // The main list cannot observe this deletion; mark the
+                // app dirty so its row is re-measured when it reappears.
+                CleanerRefreshCenter.shared.markDirty(bundleID: bundleID)
                 loadLevel()
             }
         }

@@ -87,3 +87,29 @@ enum CleanerCatalog {
         return records
     }
 }
+
+/// Cross-view refresh signals. The inventory detail pages delete through
+/// ContainerInventoryService, which the main list cannot observe, so a
+/// detail deletion marks its bundle ID here. When the list reappears it
+/// consumes the marks and patches just those rows in place instead of
+/// leaving stale sizes on screen until the next full scan.
+final class CleanerRefreshCenter {
+    static let shared = CleanerRefreshCenter()
+
+    private let lock = NSLock()
+    private var dirtyBundleIDs = Set<String>()
+
+    func markDirty(bundleID: String) {
+        lock.lock()
+        dirtyBundleIDs.insert(bundleID)
+        lock.unlock()
+    }
+
+    func consumeDirty() -> Set<String> {
+        lock.lock()
+        defer { lock.unlock() }
+        let dirty = dirtyBundleIDs
+        dirtyBundleIDs.removeAll()
+        return dirty
+    }
+}
