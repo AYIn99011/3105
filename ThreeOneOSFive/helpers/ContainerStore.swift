@@ -545,9 +545,9 @@ enum ContainerStore {
             return -2
         }
         let clean = containerPath.hasSuffix("/") ? String(containerPath.dropLast()) : containerPath
-        var handle = worse_query(clean as NSString, group as NSString, true, true)
+        var handle = worse_query(clean, group, true, true)
         if handle < 0 {
-            handle = worse_query(clean as NSString, group as NSString, false, true)
+            handle = worse_query(clean, group, false, true)
         }
         if handle < 0 {
             log("grant: worse_query failed for \(clean) -> \(handle)")
