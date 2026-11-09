@@ -538,7 +538,7 @@ enum ContainerStore {
     // iOS 27 beta 5. Grants now come from worse_query (same containermanager
     // family, driven through an App Group the app owns). alt_flags is tried
     // in the upstream PoC's order (true, then false).
-    static func grantContainerAccess(_ containerPath: String) -> Int64 {
+    static func grantContainerAccess(_ containerPath: String, logFailure: Bool = true) -> Int64 {
         guard shouldUseBadQuery else { return -1 }
         guard let group = AppGroupDiscovery.workingGroupIdentifier() else {
             log("grant: no accessible app group; cannot grant \(containerPath)")
@@ -549,10 +549,17 @@ enum ContainerStore {
         if handle < 0 {
             handle = worse_query(clean, group, false, true)
         }
-        if handle < 0 {
+        if handle < 0 && logFailure {
             log("grant: worse_query failed for \(clean) -> \(handle)")
         }
         return handle
+    }
+
+    private static func registerRetainedGrant(handle: Int64, for containerPath: String) {
+        let clean = ContainerDiscoveryMerger.canonicalPath(containerPath)
+        retainedGrantLock.lock()
+        retainedGrantHandles[clean] = handle
+        retainedGrantLock.unlock()
     }
 
     // MARK: Retained grants (Cleaner)
@@ -608,29 +615,55 @@ enum ContainerStore {
     /// worse_query grant. Unresolved containers keep their fallback
     /// (UUID) identity and are filtered out by presentation policy.
     static func resolvedFilesystemApps() -> [InstalledApp] {
-        containersFromFilesystem().map { app in
-            switch ContainerIdentityResolver.resolve(
-                containerPath: app.containerPath,
-                grantAccess: grantContainerAccess,
-                releaseAccess: worse_query_release,
-                loadMetadata: readContainerMetadata
-            ) {
-            case .resolved(let metadata):
-                let info = appInfoForBundleID(metadata.bundleID) as? [String: Any] ?? [:]
-                return InstalledApp(
-                    bundleID: metadata.bundleID,
-                    name: metadata.displayName.isEmpty ? metadata.bundleID : metadata.displayName,
-                    containerPath: app.containerPath,
-                    version: info["version"] as? String ?? "",
-                    icon: info["icon"] as? UIImage
-                )
-            case .accessFailed(let code):
-                log("browser: identity resolve grant failed \(app.containerPath) -> \(code)")
-                return app
-            case .metadataUnavailable, .unsupportedIdentifier:
-                return app
-            }
+        // Adaptation: root-level traversal grants are refused by the kernel
+        // on iOS 27.3 (worse_query -6), so enumerate the container UUIDs via
+        // the inode walk and grant each concrete container path on its own —
+        // the shape worse_query was proven with. Grants stay retained so the
+        // Cleaner can scan (and later clean) through them.
+        let dirs = enumerateDirectories(path: appDataRoot).filter {
+            UUID(uuidString: ($0 as NSString).lastPathComponent) != nil
         }
+        var resolved: [InstalledApp] = []
+        var grantedCount = 0
+        var identifiedCount = 0
+        var failedCount = 0
+        for (index, dir) in dirs.enumerated() {
+            let canonical = ContainerDiscoveryMerger.canonicalPath(dir)
+            let sample = index < 5
+            let handle = grantContainerAccess(canonical, logFailure: sample)
+            guard handle >= 0 else {
+                failedCount += 1
+                if sample {
+                    log("cleaner grant sample[\(index)]: \(canonical) -> \(handle)")
+                }
+                continue
+            }
+            grantedCount += 1
+            let metadata = readContainerMetadata(containerPath: canonical)
+            let bundleID = metadata?.bundleID.trimmingCharacters(in: .whitespacesAndNewlines) ?? ""
+            guard let metadata, !bundleID.isEmpty, !bundleID.hasPrefix("systemgroup.") else {
+                if sample {
+                    log("cleaner grant sample[\(index)]: granted, metadata unavailable \(canonical)")
+                }
+                worse_query_release(handle)
+                continue
+            }
+            registerRetainedGrant(handle: handle, for: canonical)
+            identifiedCount += 1
+            if sample {
+                log("cleaner grant sample[\(index)]: \(bundleID) granted + identified")
+            }
+            let info = appInfoForBundleID(bundleID) as? [String: Any] ?? [:]
+            resolved.append(InstalledApp(
+                bundleID: bundleID,
+                name: metadata.displayName.isEmpty ? bundleID : metadata.displayName,
+                containerPath: canonical,
+                version: info["version"] as? String ?? "",
+                icon: info["icon"] as? UIImage
+            ))
+        }
+        log("cleaner: filesystem resolve total=\(dirs.count) granted=\(grantedCount) identified=\(identifiedCount) failed=\(failedCount)")
+        return resolved
     }
 
     static func inferredApp(
