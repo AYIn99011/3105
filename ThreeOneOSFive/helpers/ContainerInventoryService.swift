@@ -8,8 +8,8 @@ struct InventoryEntry: Identifiable, Equatable {
     let name: String
     let isDirectory: Bool
     let isSymlink: Bool
-    let bytes: Int64
-    let itemCount: Int
+    var bytes: Int64
+    var itemCount: Int
     let isProtected: Bool
 
     var id: String { relativePath }
@@ -122,6 +122,106 @@ enum ContainerInventoryService {
         }
     }
 
+    // MARK: - Shallow listing + progressive measuring
+
+    /// Names and types only, no recursion: a level renders immediately even
+    /// when it contains a multi-GB subtree. Sizes arrive via measureEntry.
+    static func shallowEntries(containerPath: String, relativePath: String) -> [InventoryEntry] {
+        guard let rootDescriptor = openContainerRoot(containerPath) else { return [] }
+        defer { close(rootDescriptor) }
+
+        let components = relativePath.isEmpty
+            ? []
+            : relativePath.split(separator: "/").map(String.init)
+        guard let levelDescriptor = openDirectory(
+            components: components,
+            relativeTo: rootDescriptor
+        ) else {
+            return []
+        }
+        defer { close(levelDescriptor) }
+
+        var entries: [InventoryEntry] = []
+        forEachEntry(in: levelDescriptor) { name, information in
+            let childRelativePath = relativePath.isEmpty ? name : relativePath + "/" + name
+            switch information.st_mode & S_IFMT {
+            case S_IFREG:
+                entries.append(InventoryEntry(
+                    relativePath: childRelativePath,
+                    name: name,
+                    isDirectory: false,
+                    isSymlink: false,
+                    bytes: max(0, Int64(information.st_size)),
+                    itemCount: 1,
+                    isProtected: isProtected(relativePath: childRelativePath)
+                ))
+            case S_IFDIR:
+                entries.append(InventoryEntry(
+                    relativePath: childRelativePath,
+                    name: name,
+                    isDirectory: true,
+                    isSymlink: false,
+                    bytes: 0,
+                    itemCount: 0,
+                    isProtected: isProtected(relativePath: childRelativePath)
+                ))
+            case S_IFLNK:
+                entries.append(InventoryEntry(
+                    relativePath: childRelativePath,
+                    name: name,
+                    isDirectory: false,
+                    isSymlink: true,
+                    bytes: 0,
+                    itemCount: 0,
+                    isProtected: true
+                ))
+            default:
+                break
+            }
+        }
+        return entries.sorted {
+            $0.name.localizedCaseInsensitiveCompare($1.name) == .orderedAscending
+        }
+    }
+
+    static func measureEntry(
+        containerPath: String,
+        relativePath: String
+    ) -> (bytes: Int64, itemCount: Int)? {
+        guard let rootDescriptor = openContainerRoot(containerPath) else { return nil }
+        defer { close(rootDescriptor) }
+
+        let components = relativePath.split(separator: "/").map(String.init)
+        guard let name = components.last else { return nil }
+        guard let parentDescriptor = openDirectory(
+            components: Array(components.dropLast()),
+            relativeTo: rootDescriptor
+        ) else {
+            return nil
+        }
+        defer { close(parentDescriptor) }
+
+        var information = stat()
+        let status = name.withCString {
+            fstatat(parentDescriptor, $0, &information, AT_SYMLINK_NOFOLLOW)
+        }
+        guard status == 0 else { return nil }
+        switch information.st_mode & S_IFMT {
+        case S_IFREG:
+            return (max(0, Int64(information.st_size)), 1)
+        case S_IFDIR:
+            let childDescriptor = name.withCString {
+                openat(parentDescriptor, $0, O_RDONLY | O_DIRECTORY | O_CLOEXEC | O_NOFOLLOW)
+            }
+            guard childDescriptor >= 0 else { return nil }
+            let summary = scanDirectory(childDescriptor)
+            close(childDescriptor)
+            return summary
+        default:
+            return (0, 0)
+        }
+    }
+
     // MARK: - Deletion
 
     static func delete(
@@ -129,6 +229,7 @@ enum ContainerInventoryService {
         relativePaths: [String]
     ) -> InventoryDeletionResult {
         guard let rootDescriptor = openContainerRoot(containerPath) else {
+            DiagnosticsLog.shared.log("inventory: delete aborted, container root not openable \(containerPath)")
             return InventoryDeletionResult(
                 removedItemCount: 0,
                 failedItemCount: relativePaths.count,
@@ -149,6 +250,7 @@ enum ContainerInventoryService {
                 components: parentComponents,
                 relativeTo: rootDescriptor
             ) else {
+                DiagnosticsLog.shared.log("inventory: delete \(relativePath) parent open failed errno=\(errno)")
                 failed += 1
                 continue
             }
@@ -168,6 +270,7 @@ enum ContainerInventoryService {
                     openat(parentDescriptor, $0, O_RDONLY | O_DIRECTORY | O_CLOEXEC | O_NOFOLLOW)
                 }
                 guard childDescriptor >= 0 else {
+                    DiagnosticsLog.shared.log("inventory: delete \(relativePath) dir open failed errno=\(errno)")
                     failed += 1
                     close(parentDescriptor)
                     continue
@@ -178,6 +281,9 @@ enum ContainerInventoryService {
                 close(childDescriptor)
                 let result = name.withCString {
                     unlinkat(parentDescriptor, $0, AT_REMOVEDIR)
+                }
+                if result != 0 {
+                    DiagnosticsLog.shared.log("inventory: delete \(relativePath) rmdir failed errno=\(errno) removedContents=\(summary.removedItemCount) failedContents=\(summary.failedItemCount)")
                 }
                 if result == 0 {
                     removed += summary.removedItemCount

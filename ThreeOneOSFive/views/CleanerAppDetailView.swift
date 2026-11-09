@@ -65,6 +65,7 @@ struct CleanerAppDetailView: View {
     @ObservedObject var model: CleanerInventoryModel
 
     @State private var entries: [InventoryEntry] = []
+    @State private var measuredPaths = Set<String>()
     @State private var isLoading = true
     @State private var pendingUnlock: InventoryEntry?
     @State private var pendingBatch: BatchKind?
@@ -205,24 +206,6 @@ struct CleanerAppDetailView: View {
         HStack(spacing: 10) {
             selectionControl(entry)
 
-            VStack(alignment: .leading, spacing: 2) {
-                Text(entry.name)
-                    .font(.subheadline.weight(.medium))
-                    .lineLimit(1)
-                    .truncationMode(.middle)
-                Text(entry.isDirectory
-                    ? "\(entry.itemCount) 个文件"
-                    : (entry.isSymlink ? "符号链接 · 不跟随" : "文件"))
-                    .font(.caption2)
-                    .foregroundStyle(.secondary)
-            }
-
-            Spacer(minLength: 8)
-
-            Text(sizeText(entry.bytes))
-                .font(.caption.monospacedDigit())
-                .foregroundStyle(.secondary)
-
             if entry.isDirectory {
                 NavigationLink {
                     CleanerAppDetailView(
@@ -232,11 +215,11 @@ struct CleanerAppDetailView: View {
                         model: model
                     )
                 } label: {
-                    Image(systemName: "chevron.right")
-                        .font(.caption.weight(.semibold))
-                        .foregroundStyle(.tertiary)
+                    entryContent(entry)
                 }
-                .frame(width: 22)
+                .buttonStyle(.plain)
+            } else {
+                entryContent(entry)
             }
         }
         .contentShape(Rectangle())
@@ -245,6 +228,42 @@ struct CleanerAppDetailView: View {
                 pendingUnlock = entry
             }
         }
+    }
+
+    private func entryContent(_ entry: InventoryEntry) -> some View {
+        HStack(spacing: 8) {
+            VStack(alignment: .leading, spacing: 2) {
+                Text(entry.name)
+                    .font(.subheadline.weight(.medium))
+                    .lineLimit(1)
+                    .truncationMode(.middle)
+                Text(subtitle(entry))
+                    .font(.caption2)
+                    .foregroundStyle(.secondary)
+            }
+
+            Spacer(minLength: 8)
+
+            Text(measuredPaths.contains(entry.relativePath) || !entry.isDirectory
+                ? sizeText(entry.bytes)
+                : "计算中")
+                .font(.caption.monospacedDigit())
+                .foregroundStyle(.secondary)
+
+            if entry.isDirectory {
+                Image(systemName: "chevron.right")
+                    .font(.caption.weight(.semibold))
+                    .foregroundStyle(.tertiary)
+            }
+        }
+    }
+
+    private func subtitle(_ entry: InventoryEntry) -> String {
+        if entry.isSymlink { return "符号链接 · 不跟随" }
+        if !entry.isDirectory { return "文件" }
+        return measuredPaths.contains(entry.relativePath)
+            ? "\(entry.itemCount) 个文件"
+            : "正在统计…"
     }
 
     @ViewBuilder
@@ -290,26 +309,58 @@ struct CleanerAppDetailView: View {
 
     private func loadLevel() {
         isLoading = true
+        measuredPaths = []
         let containerPath = model.containerPath
         let level = relativePath
         DispatchQueue.global(qos: .userInitiated).async {
-            let loaded = ContainerInventoryService.listLevel(
+            // Shallow first: the level renders instantly even above a
+            // multi-GB subtree; recursive sizing streams in per entry.
+            let shallow = ContainerInventoryService.shallowEntries(
                 containerPath: containerPath,
                 relativePath: level
             )
             DispatchQueue.main.async {
-                entries = loaded
+                entries = shallow
                 isLoading = false
-                for entry in loaded {
-                    model.entrySizes[entry.relativePath] = entry.bytes
-                    if model.defaultsApplied.insert(entry.relativePath).inserted,
-                       !entry.isProtected,
-                       !entry.isSymlink,
-                       ContainerInventoryService.isDefaultSelected(relativePath: entry.relativePath) {
-                        model.selectedPaths.insert(entry.relativePath)
+                for entry in shallow {
+                    if !entry.isDirectory {
+                        measuredPaths.insert(entry.relativePath)
+                        model.entrySizes[entry.relativePath] = entry.bytes
                     }
+                    applyDefaultSelection(entry)
                 }
             }
+            for entry in shallow where entry.isDirectory {
+                guard let measured = ContainerInventoryService.measureEntry(
+                    containerPath: containerPath,
+                    relativePath: entry.relativePath
+                ) else {
+                    continue
+                }
+                DispatchQueue.main.async {
+                    if let index = entries.firstIndex(where: { $0.id == entry.id }) {
+                        entries[index].bytes = measured.bytes
+                        entries[index].itemCount = measured.itemCount
+                    }
+                    measuredPaths.insert(entry.relativePath)
+                    model.entrySizes[entry.relativePath] = measured.bytes
+                }
+            }
+            DispatchQueue.main.async {
+                entries.sort {
+                    if $0.bytes != $1.bytes { return $0.bytes > $1.bytes }
+                    return $0.name.localizedCaseInsensitiveCompare($1.name) == .orderedAscending
+                }
+            }
+        }
+    }
+
+    private func applyDefaultSelection(_ entry: InventoryEntry) {
+        if model.defaultsApplied.insert(entry.relativePath).inserted,
+           !entry.isProtected,
+           !entry.isSymlink,
+           ContainerInventoryService.isDefaultSelected(relativePath: entry.relativePath) {
+            model.selectedPaths.insert(entry.relativePath)
         }
     }
 
@@ -318,6 +369,9 @@ struct CleanerAppDetailView: View {
         isCleaning = true
         let containerPath = model.containerPath
         DispatchQueue.global(qos: .userInitiated).async {
+            // Grants can go stale while the user browses levels; renew
+            // this container's grant immediately before deleting.
+            _ = ContainerStore.retainContainerAccess(containerPath)
             let result = ContainerInventoryService.delete(
                 containerPath: containerPath,
                 relativePaths: paths
