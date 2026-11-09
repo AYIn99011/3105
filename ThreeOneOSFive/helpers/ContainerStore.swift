@@ -545,9 +545,9 @@ enum ContainerStore {
             return -2
         }
         let clean = containerPath.hasSuffix("/") ? String(containerPath.dropLast()) : containerPath
-        var handle = worse_query(clean, group, true, true)
+        var handle = worse_query(clean, group, false, true)
         if handle < 0 {
-            handle = worse_query(clean, group, false, true)
+            handle = worse_query(clean, group, true, true)
         }
         if handle < 0 && logFailure {
             log("grant: worse_query failed for \(clean) -> \(handle)")
@@ -655,8 +655,39 @@ enum ContainerStore {
                 closedir(dir)
             }
             log("probe: alt=\(alt) opendir entries=\(entryCount)")
+            var st = stat()
+            if stat(metadataPath, &st) == 0 {
+                log("probe: alt=\(alt) metadata stat size=\(st.st_size) flags=0x\(String(st.st_flags, radix: 16)) mode=0o\(String(st.st_mode, radix: 8))")
+            } else {
+                log("probe: alt=\(alt) metadata stat failed errno=\(errno)")
+            }
+            let (prefsPick, prefsEntries) = bundleIDFromPreferencesListing(containerPath: containerPath)
+            log("probe: alt=\(alt) prefs entries=\(prefsEntries.prefix(8)) pick=\(prefsPick ?? "nil")")
+            if let pick = prefsPick {
+                let prefsFile = ((containerPath as NSString).appendingPathComponent("Library/Preferences") as NSString).appendingPathComponent(pick + ".plist")
+                if let fd = fopen(prefsFile, "r") {
+                    fclose(fd)
+                    log("probe: alt=\(alt) prefs fopen ok")
+                } else {
+                    log("probe: alt=\(alt) prefs fopen failed errno=\(errno)")
+                }
+            }
             worse_query_release(handle)
         }
+    }
+
+    // Identity fallback: the container metadata plist sits behind a
+    // stricter protection than the container itself (post-grant opendir
+    // works, fopen on the metadata file returns EPERM). Most apps leave
+    // Library/Preferences/<bundleID>.plist behind, so the directory
+    // listing alone usually names the owner.
+    private static func bundleIDFromPreferencesListing(containerPath: String) -> (bundleID: String?, entries: [String]) {
+        let prefsPath = (containerPath as NSString).appendingPathComponent("Library/Preferences")
+        let entries = (try? FileManager.default.contentsOfDirectory(atPath: prefsPath)) ?? []
+        let ids = entries.filter { $0.hasSuffix(".plist") }.map { String($0.dropLast(".plist".count)) }
+            .filter { $0.contains(".") && !$0.contains(" ") }
+        let pick = ids.first { !$0.hasPrefix("com.apple.") } ?? ids.first
+        return (pick, entries)
     }
 
     static func resolvedFilesystemApps() -> [InstalledApp] {
@@ -675,6 +706,8 @@ enum ContainerStore {
         var grantedCount = 0
         var identifiedCount = 0
         var failedCount = 0
+        var metadataIdentifiedCount = 0
+        var prefsIdentifiedCount = 0
         for (index, dir) in dirs.enumerated() {
             let canonical = ContainerDiscoveryMerger.canonicalPath(dir)
             let sample = index < 5
@@ -688,10 +721,21 @@ enum ContainerStore {
             }
             grantedCount += 1
             let metadata = readContainerMetadata(containerPath: canonical)
-            let bundleID = metadata?.bundleID.trimmingCharacters(in: .whitespacesAndNewlines) ?? ""
-            guard let metadata, !bundleID.isEmpty, !bundleID.hasPrefix("systemgroup.") else {
+            var bundleID = metadata?.bundleID.trimmingCharacters(in: .whitespacesAndNewlines) ?? ""
+            var displayName = metadata?.displayName ?? ""
+            if bundleID.isEmpty || bundleID.hasPrefix("systemgroup.") {
+                let (pick, _) = bundleIDFromPreferencesListing(containerPath: canonical)
+                if let pick, !pick.hasPrefix("systemgroup.") {
+                    bundleID = pick
+                    displayName = ""
+                    prefsIdentifiedCount += 1
+                }
+            } else {
+                metadataIdentifiedCount += 1
+            }
+            guard !bundleID.isEmpty, !bundleID.hasPrefix("systemgroup.") else {
                 if sample {
-                    log("cleaner grant sample[\(index)]: granted, metadata unavailable \(canonical)")
+                    log("cleaner grant sample[\(index)]: granted, identity unavailable \(canonical)")
                 }
                 worse_query_release(handle)
                 continue
@@ -704,13 +748,13 @@ enum ContainerStore {
             let info = appInfoForBundleID(bundleID) as? [String: Any] ?? [:]
             resolved.append(InstalledApp(
                 bundleID: bundleID,
-                name: metadata.displayName.isEmpty ? bundleID : metadata.displayName,
+                name: displayName.isEmpty ? bundleID : displayName,
                 containerPath: canonical,
                 version: info["version"] as? String ?? "",
                 icon: info["icon"] as? UIImage
             ))
         }
-        log("cleaner: filesystem resolve total=\(dirs.count) granted=\(grantedCount) identified=\(identifiedCount) failed=\(failedCount)")
+        log("cleaner: filesystem resolve total=\(dirs.count) granted=\(grantedCount) identified=\(identifiedCount) (metadata=\(metadataIdentifiedCount) prefs=\(prefsIdentifiedCount)) failed=\(failedCount)")
         return resolved
     }
 
