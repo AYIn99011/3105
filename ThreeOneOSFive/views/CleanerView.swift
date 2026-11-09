@@ -159,42 +159,10 @@ struct CleanerView: View {
     }
 
     private func cleanerRow(_ record: CleanerAppRecord) -> some View {
-        HStack(spacing: 10) {
-            Button {
-                toggleSelection(record.id)
-            } label: {
-                Image(systemName: selectedBundleIDs.contains(record.id) ? "checkmark.circle.fill" : "circle")
-                    .font(.system(size: AppTheme.selectionIconSize, weight: .medium))
-                    .foregroundStyle(selectedBundleIDs.contains(record.id) ? AppTheme.accent : Color.secondary)
-                    .frame(width: 30, height: 40)
-            }
-            .buttonStyle(.plain)
-            .disabled(isCleaning)
-
-            BrowserAppIcon(app: record.app)
-
-            VStack(alignment: .leading, spacing: 2) {
-                Text(record.app.displayName)
-                    .font(.subheadline.weight(.semibold))
-                    .foregroundStyle(.primary)
-                    .lineLimit(1)
-                Text(record.app.bundleID)
-                    .font(.caption2.monospaced())
-                    .foregroundStyle(.secondary)
-                    .lineLimit(1)
-                    .truncationMode(.middle)
-            }
-            .frame(maxWidth: .infinity, alignment: .leading)
-            .contentShape(Rectangle())
-            .onTapGesture {
-                if !isCleaning { toggleSelection(record.id) }
-            }
-
-            Text(sizeText(record.displayBytes))
-                .font(.caption.monospacedDigit())
-                .foregroundStyle(.secondary)
-                .fixedSize()
-
+        // Navigation rides invisibly behind the row (the List adds its own
+        // single disclosure chevron). A visible link plus icon placeholder
+        // used to squeeze the name column into truncation.
+        ZStack {
             if record.app.bundleID != "com.apple.mobile.MobileHouseArrest" {
                 NavigationLink {
                     CleanerAppInventoryRoot(
@@ -203,15 +171,48 @@ struct CleanerView: View {
                         containerPath: record.app.containerPath
                     )
                 } label: {
-                    Image(systemName: "chevron.right")
-                        .font(.caption.weight(.semibold))
-                        .foregroundStyle(.tertiary)
-                        .frame(width: 24, height: 40)
+                    EmptyView()
                 }
+                .opacity(0)
                 .disabled(isCleaning)
             }
+
+            HStack(spacing: 10) {
+                Button {
+                    toggleSelection(record.id)
+                } label: {
+                    Image(systemName: selectedBundleIDs.contains(record.id) ? "checkmark.circle.fill" : "circle")
+                        .font(.system(size: AppTheme.selectionIconSize, weight: .medium))
+                        .foregroundStyle(selectedBundleIDs.contains(record.id) ? AppTheme.accent : Color.secondary)
+                        .frame(width: 30, height: 40)
+                }
+                .buttonStyle(.plain)
+                .disabled(isCleaning)
+
+                VStack(alignment: .leading, spacing: 2) {
+                    Text(record.app.displayName)
+                        .font(.subheadline.weight(.semibold))
+                        .foregroundStyle(.primary)
+                        .lineLimit(1)
+                    Text(record.app.bundleID)
+                        .font(.caption2.monospaced())
+                        .foregroundStyle(.secondary)
+                        .lineLimit(1)
+                        .truncationMode(.middle)
+                }
+                .frame(maxWidth: .infinity, alignment: .leading)
+                .contentShape(Rectangle())
+                .onTapGesture {
+                    if !isCleaning { toggleSelection(record.id) }
+                }
+
+                Text(sizeText(record.displayBytes))
+                    .font(.caption.monospacedDigit())
+                    .foregroundStyle(.secondary)
+                    .fixedSize()
+            }
+            .padding(.vertical, 2)
         }
-        .padding(.vertical, 2)
     }
 
     private func applicationRow(_ record: CleanerAppRecord) -> some View {
