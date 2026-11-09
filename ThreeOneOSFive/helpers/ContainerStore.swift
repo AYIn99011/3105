@@ -749,6 +749,82 @@ enum ContainerStore {
         return nil
     }
 
+    // MARK: - Display names from bundle containers
+
+    private static var cachedBundleDisplayNames: [String: String]?
+
+    /// Friendly names live in each app bundle's Info.plist, under
+    /// /var/containers/Bundle/Application/<uuid>/<App>.app — a different
+    /// tree from the data containers. Read directly when possible and fall
+    /// back to a worse_query grant per bundle container when not.
+    static func bundleDisplayNames() -> [String: String] {
+        if let cachedBundleDisplayNames { return cachedBundleDisplayNames }
+        var map: [String: String] = [:]
+        let root = "/var/containers/Bundle/Application"
+        let dirs = enumerateDirectories(path: root).filter {
+            UUID(uuidString: ($0 as NSString).lastPathComponent) != nil
+        }
+        var grantedReads = 0
+        for dir in dirs {
+            let canonical = ContainerDiscoveryMerger.canonicalPath(dir)
+            if let pair = readBundleIdentity(containerPath: canonical) {
+                map[pair.bundleID] = pair.name
+                continue
+            }
+            let handle = grantContainerAccess(canonical, logFailure: false)
+            guard handle >= 0 else { continue }
+            if let pair = readBundleIdentity(containerPath: canonical) {
+                map[pair.bundleID] = pair.name
+                grantedReads += 1
+            }
+            worse_query_release(handle)
+        }
+        log("cleaner: bundle names containers=\(dirs.count) mapped=\(map.count) grantedReads=\(grantedReads)")
+        cachedBundleDisplayNames = map
+        return map
+    }
+
+    private static func readBundleIdentity(
+        containerPath: String
+    ) -> (bundleID: String, name: String)? {
+        guard let entries = try? FileManager.default.contentsOfDirectory(atPath: containerPath),
+              let appDir = entries.first(where: { $0.hasSuffix(".app") }) else {
+            return nil
+        }
+        let appPath = (containerPath as NSString).appendingPathComponent(appDir)
+        let plistPath = (appPath as NSString).appendingPathComponent("Info.plist")
+        guard let data = try? Data(contentsOf: URL(fileURLWithPath: plistPath)),
+              let plist = try? PropertyListSerialization.propertyList(
+                  from: data, options: [], format: nil
+              ) as? [String: Any],
+              let bundleID = plist["CFBundleIdentifier"] as? String,
+              !bundleID.isEmpty else {
+            return nil
+        }
+        // Localized display name wins: zh-Hans first, then any Chinese, then English.
+        let lprojPreference = ["zh-Hans.lproj", "zh_CN.lproj", "zh-Hant.lproj", "en.lproj"]
+        var localized: String?
+        for lproj in lprojPreference {
+            let stringsPath = ((appPath as NSString)
+                .appendingPathComponent(lproj) as NSString)
+                .appendingPathComponent("InfoPlist.strings")
+            if let stringsData = try? Data(contentsOf: URL(fileURLWithPath: stringsPath)),
+               let strings = try? PropertyListSerialization.propertyList(
+                   from: stringsData, options: [], format: nil
+               ) as? [String: Any],
+               let value = strings["CFBundleDisplayName"] as? String,
+               !value.isEmpty {
+                localized = value
+                break
+            }
+        }
+        let name = localized
+            ?? (plist["CFBundleDisplayName"] as? String)
+            ?? (plist["CFBundleName"] as? String)
+            ?? bundleID
+        return (bundleID, name)
+    }
+
     static func resolvedFilesystemApps() -> [InstalledApp] {
         // Adaptation: root-level traversal grants are refused by the kernel
         // on iOS 27.3 (worse_query -6), so enumerate the container UUIDs via
@@ -761,6 +837,7 @@ enum ContainerStore {
         if let first = dirs.first {
             probeContainerAccess(containerPath: ContainerDiscoveryMerger.canonicalPath(first))
         }
+        let displayNames = bundleDisplayNames()
         var resolved: [InstalledApp] = []
         var grantedCount = 0
         var identifiedCount = 0
@@ -820,7 +897,9 @@ enum ContainerStore {
             let info = appInfoForBundleID(bundleID) as? [String: Any] ?? [:]
             let app = InstalledApp(
                 bundleID: bundleID,
-                name: displayName.isEmpty ? bundleID : displayName,
+                name: displayName.isEmpty
+                    ? (displayNames[bundleID] ?? bundleID)
+                    : displayName,
                 containerPath: canonical,
                 version: info["version"] as? String ?? "",
                 icon: info["icon"] as? UIImage
