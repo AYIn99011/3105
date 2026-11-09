@@ -274,41 +274,46 @@ struct AppTypeCleanView: View {
         }
     }
 
-    /// Classification units: the children of tmp, of Library/Caches and of
-    /// Documents, plus Library's own children, with Application Support
-    /// expanded one level (its bundle-named children classify as .other
-    /// rather than dragging the whole directory into one bucket).
+    /// Classification units are discovered by a recursive walk: any entry
+    /// the classifier recognizes becomes a unit at whatever depth it lives
+    /// (a cache buried at Documents/<sdk>/<id>/cache is no longer hidden
+    /// inside an unclassified parent), and unclassified directories are
+    /// descended into. A directory whose subtree yields nothing classifiable
+    /// is recorded whole as .other, so no space silently disappears from
+    /// the panel. tmp and Library/Caches stay transparent: their children
+    /// are the units, never the directories themselves.
     private static func scanGroups(containerPath: String) -> [TypeGroup] {
         _ = ContainerStore.retainContainerAccess(containerPath)
         var units: [InventoryEntry] = []
-        let root = ContainerInventoryService.listLevel(containerPath: containerPath, relativePath: "")
-        for entry in root {
-            switch entry.name {
-            case "tmp":
-                units.append(contentsOf: ContainerInventoryService.listLevel(
-                    containerPath: containerPath, relativePath: "tmp"))
-            case "Library":
-                for child in ContainerInventoryService.listLevel(
-                    containerPath: containerPath, relativePath: "Library") {
-                    if child.name == "Caches" {
-                        units.append(contentsOf: ContainerInventoryService.listLevel(
-                            containerPath: containerPath, relativePath: "Library/Caches"))
-                    } else if child.name == "Application Support" {
-                        units.append(contentsOf: ContainerInventoryService.listLevel(
-                            containerPath: containerPath, relativePath: "Library/Application Support"))
-                    } else {
-                        units.append(child)
-                    }
+        var visited = 0
+
+        func walk(relativePath: String, depth: Int) {
+            for entry in ContainerInventoryService.listLevel(
+                containerPath: containerPath, relativePath: relativePath) {
+                if entry.isSymlink { continue }
+                visited += 1
+                if entry.relativePath == "tmp" || entry.relativePath == "Library/Caches" {
+                    walk(relativePath: entry.relativePath, depth: depth + 1)
+                    continue
                 }
-            case "Documents":
-                units.append(contentsOf: ContainerInventoryService.listLevel(
-                    containerPath: containerPath, relativePath: "Documents"))
-            default:
-                units.append(entry)
+                let type = FolderTypeClassifier.classify(entry: entry)
+                if type != .other {
+                    units.append(entry)
+                    continue
+                }
+                if entry.isDirectory, depth < 8, visited < 60000 {
+                    let before = units.count
+                    walk(relativePath: entry.relativePath, depth: depth + 1)
+                    if units.count == before { units.append(entry) }
+                } else {
+                    units.append(entry)
+                }
             }
         }
+        walk(relativePath: "", depth: 0)
+
         var byType: [FolderType: TypeGroup] = [:]
-        for unit in units where !unit.isSymlink {
+        for unit in units {
             let type = FolderTypeClassifier.classify(entry: unit)
             var group = byType[type] ?? TypeGroup(type: type)
             group.paths.append(unit.relativePath)
