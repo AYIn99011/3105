@@ -568,10 +568,12 @@ struct CleanerView: View {
                       let usage = try? LimitedCleanerService.scan(
                           containerURL: URL(fileURLWithPath: app.containerPath, isDirectory: true),
                           rootValidator: { ContainerStore.isApplicationContainerPath($0.path) }
-                      ),
-                      usage.totalBytes > 0 else {
+                      ) else {
                     continue
                 }
+                // Zero cache/tmp usage must not hide the app: the big
+                // chat/video apps keep their bulk in Documents and other
+                // Library folders, which the inventory now covers.
                 discoveredRecords.append(CleanerAppRecord(app: app, usage: usage))
                 scannedBundleIDs.insert(app.bundleID)
                 directAdded += 1
