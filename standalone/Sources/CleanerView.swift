@@ -526,6 +526,8 @@ struct CleanerView: View {
 
             let filesystemApps = ContainerStore.resolvedFilesystemApps()
             collect(filesystemApps, into: &directApps)
+            let groupApps = ContainerStore.resolvedGroupContainers()
+            collect(groupApps, into: &directApps)
             // Every filesystem-resolved app stays reachable as a
             // fallback: if an ID was claimed by an earlier source but
             // its activation fails, the granted filesystem path is
@@ -574,7 +576,7 @@ struct CleanerView: View {
                     if let containerPath,
                        let usage = try? LimitedCleanerService.scan(
                            containerURL: URL(fileURLWithPath: containerPath, isDirectory: true),
-                           rootValidator: { ContainerStore.isApplicationContainerPath($0.path) }
+                           rootValidator: { ContainerStore.isCleanableContainerPath($0.path) }
                        ) {
                         record = CleanerAppRecord(
                             app: InstalledApp(
@@ -700,7 +702,7 @@ struct CleanerView: View {
                 let target = targets[index]
                 let usage = try? LimitedCleanerService.scan(
                     containerURL: URL(fileURLWithPath: target.app.containerPath, isDirectory: true),
-                    rootValidator: { ContainerStore.isApplicationContainerPath($0.path) }
+                    rootValidator: { ContainerStore.isCleanableContainerPath($0.path) }
                 )
                 let full = ContainerInventoryService.measureContainer(
                     containerPath: target.app.containerPath
@@ -737,9 +739,12 @@ struct CleanerView: View {
 
             for record in selectedRecords {
                 defer { DispatchQueue.main.async { progressDone += 1 } }
-                guard let containerPath = ContainerStore.resolveAppContainerPath(
-                    bundleID: record.app.bundleID
-                ) else {
+                // Records carry their granted container path (group and
+                // unknown containers have no bundle ID to resolve by).
+                let containerPath = !record.app.containerPath.isEmpty
+                    ? record.app.containerPath
+                    : ContainerStore.resolveAppContainerPath(bundleID: record.app.bundleID)
+                guard let containerPath else {
                     unavailableApps += 1
                     log("cleaner: bundle unavailable \(record.app.bundleID)")
                     continue
@@ -751,7 +756,7 @@ struct CleanerView: View {
                 let outcome = AppTypeCleanView.cleanDefaultTypes(containerPath: containerPath)
                 if let usage = try? LimitedCleanerService.scan(
                     containerURL: URL(fileURLWithPath: containerPath, isDirectory: true),
-                    rootValidator: { ContainerStore.isApplicationContainerPath($0.path) }
+                    rootValidator: { ContainerStore.isCleanableContainerPath($0.path) }
                 ) {
                     updatedUsage[record.id] = usage
                 }

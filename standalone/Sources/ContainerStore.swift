@@ -67,6 +67,8 @@ struct FileEntry: Identifiable, Hashable {
 enum ContainerStore {
     static let appDataRoot = "/var/mobile/Containers/Data/Application"
     static let systemDataRoot = "/var/mobile/Containers/Data/System"
+    static let pluginDataRoot = "/var/mobile/Containers/Data/PluginKitPlugin"
+    static let appGroupRoot = "/var/mobile/Containers/Shared/AppGroup"
     private static var shouldUseBadQuery: Bool {
         ProcessInfo.processInfo.operatingSystemVersion.majorVersion >= 26
     }
@@ -475,11 +477,148 @@ enum ContainerStore {
         return identifiers
     }
 
+    // MARK: LaunchServices store (full parse)
+
+    struct LSStoreMaps {
+        var displayNames: [String: String] = [:]
+        var bundleNames: [String: String] = [:]
+        var containerOwners: [String: String] = [:]
+        var bundlePaths: [String: String] = [:]
+        var groupPaths: [String] = []
+        var loaded = false
+    }
+
+    private static var lsMapsCache: LSStoreMaps?
+    private static let lsMapsLock = NSLock()
+
+    /// Locates the newest LaunchServices CSStore2 blob, using the same
+    /// discovery as launchServicesStoreIdentifiers (lsd's container via
+    /// MCM class 10, or the system-root metadata scan).
+    static func launchServicesStoreData() -> Data? {
+        var cachePaths: [String] = []
+        var seenCachePaths = Set<String>()
+        func addCachePath(_ rawPath: String) {
+            let path = ContainerDiscoveryMerger.canonicalPath(rawPath)
+            guard !path.isEmpty, seenCachePaths.insert(path).inserted else { return }
+            cachePaths.append(path)
+        }
+        var leasedCachePaths = Set<String>()
+        var serviceLookupError: NSString?
+        if let servicePath = MCMActivateContainerPath(
+            10,
+            "com.apple.lsd",
+            false,
+            &serviceLookupError
+        ) {
+            let cachePath = (servicePath as NSString).appendingPathComponent("Library/Caches")
+            addCachePath(cachePath)
+            leasedCachePaths.insert(ContainerDiscoveryMerger.canonicalPath(cachePath))
+        }
+        let traversedSystemDirectories = enumerateDirectoriesWithTraversalGrant(path: systemDataRoot)
+        let systemDirectories = traversedSystemDirectories.isEmpty
+            ? enumerateDirectories(path: systemDataRoot)
+            : traversedSystemDirectories
+        for directory in systemDirectories {
+            guard readContainerMetadata(containerPath: directory)?.bundleID == "com.apple.lsd" else {
+                continue
+            }
+            addCachePath((directory as NSString).appendingPathComponent("Library/Caches"))
+        }
+        addCachePath("/var/db/lsd")
+        addCachePath("/var/mobile/Library/Caches")
+
+        var best: (path: String, modified: Date, size: Int64)?
+        for cachePath in cachePaths {
+            let hasLease = leasedCachePaths.contains(
+                ContainerDiscoveryMerger.canonicalPath(cachePath)
+            )
+            let handle: Int64
+            if hasLease || !shouldUseBadQuery {
+                handle = -1
+            } else {
+                handle = grantContainerAccess(cachePath, logFailure: false)
+                if handle < 0 { continue }
+            }
+            defer {
+                if handle >= 0 { worse_query_release(handle) }
+            }
+            let names = (try? FileManager.default.contentsOfDirectory(atPath: cachePath)) ?? []
+            for name in names
+            where name.hasPrefix("com.apple.LaunchServices-") && name.hasSuffix(".csstore") {
+                let storePath = (cachePath as NSString).appendingPathComponent(name)
+                guard let attrs = try? FileManager.default.attributesOfItem(atPath: storePath),
+                      let size = (attrs[.size] as? NSNumber)?.int64Value,
+                      size > 0, size <= 64 * 1_024 * 1_024 else {
+                    continue
+                }
+                let modified = (attrs[.modificationDate] as? Date) ?? .distantPast
+                if let current = best,
+                   modified < current.modified
+                    || (modified == current.modified && size <= current.size) {
+                    continue
+                }
+                best = (storePath, modified, size)
+            }
+        }
+        guard let best,
+              let data = try? Data(contentsOf: URL(fileURLWithPath: best.path), options: .mappedIfSafe),
+              data.count >= 4,
+              data.prefix(4) == Data([0x62, 0x64, 0x73, 0x6c]) else {
+            return nil
+        }
+        log("cleaner: LS store located bytes=\(data.count)")
+        return data
+    }
+
+    /// Parses the store once per process. The maps are the system's own
+    /// record: bundle ID -> display name, container path -> bundle ID,
+    /// and the shared AppGroup container paths.
+    static func lsStoreMaps() -> LSStoreMaps {
+        lsMapsLock.lock()
+        defer { lsMapsLock.unlock() }
+        if let cached = lsMapsCache { return cached }
+        var maps = LSStoreMaps()
+        if let data = launchServicesStoreData(),
+           let parsed = LSStoreParse(data) as? [String: Any] {
+            maps.displayNames = parsed["display"] as? [String: String] ?? [:]
+            maps.bundleNames = parsed["bundleName"] as? [String: String] ?? [:]
+            if let containers = parsed["containers"] as? [String: String] {
+                for (path, bundleID) in containers {
+                    maps.containerOwners[ContainerDiscoveryMerger.canonicalPath(path)] = bundleID
+                }
+            }
+            maps.bundlePaths = parsed["bundlePaths"] as? [String: String] ?? [:]
+            maps.groupPaths = (parsed["groups"] as? [String] ?? []).map {
+                ContainerDiscoveryMerger.canonicalPath($0)
+            }
+            maps.loaded = true
+            log("cleaner: LS store parsed: \(parsed["summary"] as? String ?? "?")")
+        } else {
+            log("cleaner: LS store unavailable")
+        }
+        lsMapsCache = maps
+        return maps
+    }
+
     static func isApplicationContainerPath(_ path: String) -> Bool {
         let canonicalRoot = ContainerDiscoveryMerger.canonicalPath(appDataRoot)
         let canonicalPath = ContainerDiscoveryMerger.canonicalPath(path)
         guard canonicalPath.hasPrefix(canonicalRoot + "/") else { return false }
         return UUID(uuidString: (canonicalPath as NSString).lastPathComponent) != nil
+    }
+
+    static func isAppGroupContainerPath(_ path: String) -> Bool {
+        let canonicalRoot = ContainerDiscoveryMerger.canonicalPath(appGroupRoot)
+        let canonicalPath = ContainerDiscoveryMerger.canonicalPath(path)
+        guard canonicalPath.hasPrefix(canonicalRoot + "/") else { return false }
+        return UUID(uuidString: (canonicalPath as NSString).lastPathComponent) != nil
+    }
+
+    /// Roots the cleaner's fd-relative machinery may operate in: app data
+    /// containers and shared AppGroup containers. Everything else (system
+    /// containers, the media library, arbitrary paths) stays out of reach.
+    static func isCleanableContainerPath(_ path: String) -> Bool {
+        isApplicationContainerPath(path) || isAppGroupContainerPath(path)
     }
 
     // MARK: Filesystem discovery
@@ -807,6 +946,7 @@ enum ContainerStore {
         var verifiedIdentifiedCount = 0
         var unresolvedLogged = 0
         var unclaimedPaths: [String] = []
+        var unclaimedHandles: [String: Int64] = [:]
         var unidentifiedLogged = 0
         var resolvedIndexByPath: [String: Int] = [:]
         var resolvedIndexByBundleID: [String: Int] = [:]
@@ -837,11 +977,11 @@ enum ContainerStore {
             }
             guard !bundleID.isEmpty, !bundleID.hasPrefix("systemgroup.") else {
                 unclaimedPaths.append(canonical)
+                unclaimedHandles[canonical] = handle
                 if unidentifiedLogged < 12 {
                     unidentifiedLogged += 1
                     log("cleaner: unidentified \(canonical) candidates=\(identity.candidates.count)")
                 }
-                worse_query_release(handle)
                 continue
             }
             registerRetainedGrant(handle: handle, for: canonical)
@@ -928,10 +1068,93 @@ enum ContainerStore {
             log("cleaner: dictionary probe hits=\(probeHits)")
         }
 
-        // Friendly names from the built-in table; bundle containers are
-        // unreachable in this sandbox (see KnownApps).
+        // LaunchServices store pass: the CSStore2 database lsd maintains
+        // maps container paths to bundle IDs authoritatively, including
+        // apps whose prefs live in an App Group suite. Claims made here
+        // count as verified, so the probe rules above never displace them.
+        let lsMaps = lsStoreMaps()
+        if lsMaps.loaded {
+            var lsHits = 0
+            for path in unclaimedPaths where resolvedIndexByPath[path] == nil {
+                guard let bundleID = lsMaps.containerOwners[path],
+                      !bundleID.hasPrefix("systemgroup."),
+                      resolvedIndexByBundleID[bundleID] == nil,
+                      let handle = unclaimedHandles[path] else {
+                    continue
+                }
+                registerRetainedGrant(handle: handle, for: path)
+                let info = appInfoForBundleID(bundleID) as? [String: Any] ?? [:]
+                let app = InstalledApp(
+                    bundleID: bundleID,
+                    name: lsMaps.displayNames[bundleID] ?? bundleID,
+                    containerPath: path,
+                    version: info["version"] as? String ?? "",
+                    icon: info["icon"] as? UIImage
+                )
+                resolvedIndexByPath[path] = resolved.count
+                resolvedIndexByBundleID[bundleID] = resolved.count
+                resolvedVerified[bundleID] = true
+                resolved.append(app)
+                lsHits += 1
+            }
+            // Containers the inode walk never enumerated: extensions live
+            // under PluginKitPlugin, and a busy volume can hide app
+            // containers from the walk as well.
+            for (path, bundleID) in lsMaps.containerOwners
+            where resolvedIndexByPath[path] == nil && resolvedIndexByBundleID[bundleID] == nil {
+                guard !bundleID.hasPrefix("systemgroup.") else { continue }
+                let sweepHandle = grantContainerAccess(path, logFailure: false)
+                guard sweepHandle >= 0 else { continue }
+                registerRetainedGrant(handle: sweepHandle, for: path)
+                let info = appInfoForBundleID(bundleID) as? [String: Any] ?? [:]
+                let app = InstalledApp(
+                    bundleID: bundleID,
+                    name: lsMaps.displayNames[bundleID] ?? bundleID,
+                    containerPath: path,
+                    version: info["version"] as? String ?? "",
+                    icon: info["icon"] as? UIImage
+                )
+                resolvedIndexByPath[path] = resolved.count
+                resolvedIndexByBundleID[bundleID] = resolved.count
+                resolvedVerified[bundleID] = true
+                resolved.append(app)
+                lsHits += 1
+            }
+            if lsHits > 0 {
+                log("cleaner: LS store claims=\(lsHits)")
+            }
+        }
+
+        // Anything still unclaimed stays visible as an unknown container
+        // instead of vanishing: it can be browsed and type-cleaned by
+        // path, and a later identity source can still name it.
+        var unknownCount = 0
+        for path in unclaimedPaths where resolvedIndexByPath[path] == nil {
+            guard let handle = unclaimedHandles[path] else { continue }
+            registerRetainedGrant(handle: handle, for: path)
+            let uuid = (path as NSString).lastPathComponent
+            resolvedIndexByPath[path] = resolved.count
+            resolved.append(InstalledApp(
+                bundleID: "unknown:" + uuid,
+                name: "未知应用",
+                containerPath: path,
+                version: "",
+                icon: nil
+            ))
+            unknownCount += 1
+        }
+        if unknownCount > 0 {
+            log("cleaner: unknown containers listed=\(unknownCount)")
+        }
+
+        // Friendly names: the LaunchServices store first (the system's
+        // own current record), then the built-in table, then the store's
+        // bundle-name field.
         resolved = resolved.map { app in
-            guard let friendly = KnownApps.displayName(for: app.bundleID) else { return app }
+            let friendly = lsMaps.displayNames[app.bundleID]
+                ?? KnownApps.displayName(for: app.bundleID)
+                ?? lsMaps.bundleNames[app.bundleID]
+            guard let friendly, friendly != app.name else { return app }
             return InstalledApp(
                 bundleID: app.bundleID,
                 name: friendly,
@@ -941,6 +1164,68 @@ enum ContainerStore {
             )
         }
         return resolved
+    }
+
+    /// Shared AppGroup containers: paths come from the LaunchServices
+    /// store's group list plus an inode walk of the group root. Grants
+    /// work on these paths on iOS 27 (proven by FilzaWorse and WQFiles
+    /// on the same primitive). Ownership is best-effort: the container
+    /// metadata when readable, else a Preferences filename inside that
+    /// names a known bundle ID. Rows stay separate from the owning app
+    /// on purpose -- group containers hold shared state (including
+    /// login suites), so their bytes never fold into the app's row.
+    static func resolvedGroupContainers() -> [InstalledApp] {
+        let lsMaps = lsStoreMaps()
+        var paths = Set(lsMaps.groupPaths)
+        for dir in enumerateDirectories(path: appGroupRoot)
+        where UUID(uuidString: (dir as NSString).lastPathComponent) != nil {
+            paths.insert(ContainerDiscoveryMerger.canonicalPath(dir))
+        }
+        var apps: [InstalledApp] = []
+        for path in paths.sorted() {
+            let handle = grantContainerAccess(path, logFailure: false)
+            guard handle >= 0 else { continue }
+            registerRetainedGrant(handle: handle, for: path)
+            let metadataID = readContainerMetadata(containerPath: path)?.bundleID ?? ""
+            var groupID = metadataID
+            var ownerID: String?
+            if !metadataID.isEmpty {
+                var stripped = metadataID
+                if stripped.hasPrefix("group.") {
+                    stripped = String(stripped.dropFirst(6))
+                }
+                if isCanonicalBundleIdentifier(stripped) {
+                    ownerID = stripped
+                }
+            }
+            if ownerID == nil {
+                let prefsPath = (path as NSString).appendingPathComponent("Library/Preferences")
+                let names = (try? FileManager.default.contentsOfDirectory(atPath: prefsPath)) ?? []
+                for name in names where name.hasSuffix(".plist") {
+                    let candidate = String(name.dropLast(6))
+                    if lsMaps.displayNames[candidate] != nil
+                        || KnownApps.displayName(for: candidate) != nil {
+                        ownerID = candidate
+                        break
+                    }
+                }
+            }
+            if groupID.isEmpty {
+                groupID = ownerID ?? (path as NSString).lastPathComponent
+            }
+            let ownerName = ownerID.flatMap {
+                lsMaps.displayNames[$0] ?? KnownApps.displayName(for: $0)
+            }
+            apps.append(InstalledApp(
+                bundleID: "appgroup:" + groupID,
+                name: ownerName.map { "\($0) · 共享" } ?? "共享容器",
+                containerPath: path,
+                version: "",
+                icon: nil
+            ))
+        }
+        log("cleaner: group containers listed=\(apps.count) of \(paths.count) candidates")
+        return apps
     }
 
     static func inferredApp(

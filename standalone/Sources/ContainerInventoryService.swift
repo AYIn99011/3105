@@ -366,7 +366,7 @@ enum ContainerInventoryService {
     // MARK: - fd plumbing (mirrors LimitedCleanerService)
 
     private static func openContainerRoot(_ containerPath: String) -> Int32? {
-        guard ContainerStore.isApplicationContainerPath(containerPath) else { return nil }
+        guard ContainerStore.isCleanableContainerPath(containerPath) else { return nil }
         let descriptor = open(
             containerPath,
             O_RDONLY | O_DIRECTORY | O_CLOEXEC | O_NOFOLLOW

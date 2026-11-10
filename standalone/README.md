@@ -2,7 +2,7 @@
 
 从 3105（worse_query 适配版）拆出的独立清理 App：枚举全部 App 数据容器 → 逐个授权 → 认人（prefs + 名表字典探针）→ 全量统计 → 逐层盘点勾选删除（含保护项分批解锁）。仅 iOS 26/27（worse_query 射程），自签/开发者证书自用。
 
-血统：3105（YangJiiii）+ worse_query（Taj C / forcequitOS），GPL-3.0。
+血统：3105（YangJiiii）+ worse_query（Taj C / forcequitOS），GPL-3.0。LSStoreParser（LaunchServices CSStore2 数据库解析）移植自 WQFiles（kolbicz，GPL-3.0）。
 
 ## 构建（macOS 26 / Xcode 26）
 

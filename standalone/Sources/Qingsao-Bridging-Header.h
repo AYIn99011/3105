@@ -2,3 +2,4 @@
 #import "exploit/worse_query.h"
 #import "exploit/mcm_bridge.h"
 #import "helpers/AppIconHelper.h"
+#import "LSStoreParser.h"
