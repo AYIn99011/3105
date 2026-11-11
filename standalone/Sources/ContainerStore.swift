@@ -69,6 +69,7 @@ enum ContainerStore {
     static let systemDataRoot = "/var/mobile/Containers/Data/System"
     static let pluginDataRoot = "/var/mobile/Containers/Data/PluginKitPlugin"
     static let appGroupRoot = "/var/mobile/Containers/Shared/AppGroup"
+    static let daemonDataRoot = "/var/mobile/Containers/Data/InternalDaemon"
     private static var shouldUseBadQuery: Bool {
         ProcessInfo.processInfo.operatingSystemVersion.majorVersion >= 26
     }
@@ -524,6 +525,47 @@ enum ContainerStore {
             }
             addCachePath((directory as NSString).appendingPathComponent("Library/Caches"))
         }
+        // iOS 27 route: lsd keeps the store in an InternalDaemon
+        // container. MCM class 10 hands out no sandbox token for it and
+        // the System root cannot be enumerated, so walk the daemon root
+        // like the app root and inspect each container's Library/Caches.
+        var daemonBest: (modified: Date, size: Int64, data: Data)?
+        var daemonScanned = 0
+        for dir in enumerateDirectories(path: daemonDataRoot)
+        where UUID(uuidString: (dir as NSString).lastPathComponent) != nil {
+            let canonical = ContainerDiscoveryMerger.canonicalPath(dir)
+            let handle = grantContainerAccess(canonical, logFailure: false)
+            guard handle >= 0 else { continue }
+            daemonScanned += 1
+            let cachesPath = (canonical as NSString).appendingPathComponent("Library/Caches")
+            let names = (try? FileManager.default.contentsOfDirectory(atPath: cachesPath)) ?? []
+            for name in names
+            where name.hasPrefix("com.apple.LaunchServices-") && name.hasSuffix(".csstore") {
+                let storePath = (cachesPath as NSString).appendingPathComponent(name)
+                guard let attrs = try? FileManager.default.attributesOfItem(atPath: storePath),
+                      let size = (attrs[.size] as? NSNumber)?.int64Value,
+                      size > 0, size <= 64 * 1_024 * 1_024,
+                      let data = try? Data(contentsOf: URL(fileURLWithPath: storePath)),
+                      data.count >= 4,
+                      data.prefix(4) == Data([0x62, 0x64, 0x73, 0x6c]) else {
+                    continue
+                }
+                let modified = (attrs[.modificationDate] as? Date) ?? .distantPast
+                if let current = daemonBest,
+                   modified < current.modified
+                    || (modified == current.modified && size <= current.size) {
+                    continue
+                }
+                daemonBest = (modified, size, data)
+            }
+            worse_query_release(handle)
+        }
+        if let daemonBest {
+            log("cleaner: LS store via daemon scan (containers=\(daemonScanned)) bytes=\(daemonBest.data.count)")
+            return daemonBest.data
+        }
+        log("cleaner: LS daemon scan found no store (containers=\(daemonScanned))")
+
         addCachePath("/var/db/lsd")
         addCachePath("/var/mobile/Library/Caches")
 
@@ -1202,7 +1244,12 @@ enum ContainerStore {
                 let prefsPath = (path as NSString).appendingPathComponent("Library/Preferences")
                 let names = (try? FileManager.default.contentsOfDirectory(atPath: prefsPath)) ?? []
                 for name in names where name.hasSuffix(".plist") {
-                    let candidate = String(name.dropLast(6))
+                    // Suite preferences are usually named after the group
+                    // ID itself, so try the "group."-stripped form too.
+                    var candidate = String(name.dropLast(6))
+                    if candidate.hasPrefix("group.") {
+                        candidate = String(candidate.dropFirst(6))
+                    }
                     if lsMaps.displayNames[candidate] != nil
                         || KnownApps.displayName(for: candidate) != nil {
                         ownerID = candidate
