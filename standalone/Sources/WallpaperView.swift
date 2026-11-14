@@ -853,10 +853,15 @@ enum ZipWriter {
     private static func dosDateTime(_ date: Date) -> (UInt16, UInt16) {
         let cal = Calendar.current
         let c = cal.dateComponents([.year, .month, .day, .hour, .minute, .second], from: date)
-        let year = max(1980, c.year ?? 1980)
-        let time = UInt16(((c.hour ?? 0) << 11) | ((c.minute ?? 0) << 5) | ((c.second ?? 0) / 2))
-        let day = UInt16(((year - 1980) << 9) | ((c.month ?? 1) << 5) | (c.day ?? 1))
-        return (time, day)
+        let year = max(1980, c.year ?? 1980) - 1980
+        let month = c.month ?? 1
+        let dayOfMonth = c.day ?? 1
+        let hour = c.hour ?? 0
+        let minute = c.minute ?? 0
+        let second = c.second ?? 0
+        let timeValue = (hour << 11) | (minute << 5) | (second / 2)
+        let dateValue = (year << 9) | (month << 5) | dayOfMonth
+        return (UInt16(timeValue), UInt16(dateValue))
     }
 
     /// entries: (archive name, absolute source path, mtime)
