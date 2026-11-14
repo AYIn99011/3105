@@ -661,8 +661,14 @@ struct WallpaperView: View {
                             )
                         } label: {
                             HStack(spacing: 10) {
+                                if let preview = package.previewFile,
+                                   let containerPath = model.containerPath {
+                                    PackagePreviewThumb(absolutePath: ((containerPath as NSString)
+                                        .appendingPathComponent(package.relativePath) as NSString)
+                                        .appendingPathComponent(preview.relativePath))
+                                }
                                 VStack(alignment: .leading, spacing: 2) {
-                                    Text(package.displayName)
+                                    Text(package.listTitle)
                                         .font(.subheadline.weight(.medium))
                                         .lineLimit(1)
                                         .truncationMode(.middle)
@@ -672,8 +678,13 @@ struct WallpaperView: View {
                                         .lineLimit(1)
                                         .truncationMode(.middle)
                                     Text("\(package.files.count) 个文件 · \(WallpaperModel.format(package.totalBytes)) · \(Self.rowTimeFormatter.string(from: package.modified))")
-                                        .font(.caption2)
+                                        .font(".caption2)
                                         .foregroundStyle(.secondary)
+                                    if !package.wallpaperBundles.isEmpty {
+                                        Text("含壁纸源包 · \(package.sourceFiles.count) 个文件 · \(WallpaperModel.format(package.sourceBytes))")
+                                            .font(.caption2)
+                                            .foregroundStyle(.orange)
+                                    }
                                 }
                                 Spacer()
                                 Image(systemName: "chevron.right")
@@ -750,6 +761,52 @@ struct PosterPackage: Identifiable, Equatable {
     var id: String { relativePath }
     var totalBytes: Int64 { files.reduce(0) { $0 + $1.size } }
     var modified: Date { files.map(\.modified).max() ?? .distantPast }
+
+    /// `.wallpaper` source bundles inside this configuration:
+    /// bundle-root paths relative to the configuration directory.
+    /// Interactive (CoreAnimation) wallpapers live as
+    /// `versions/<n>/contents/<name>.wallpaper` subtrees; everything
+    /// else in a configuration is snapshots and metadata.
+    var wallpaperBundles: [String] {
+        var roots = Set<String>()
+        for file in files {
+            let components = file.relativePath.split(separator: "/").map(String.init)
+            guard let contentsIndex = components.firstIndex(of: "contents"),
+                  components.count > contentsIndex + 1,
+                  components[contentsIndex + 1].hasSuffix(".wallpaper") else { continue }
+            roots.insert(components[...(contentsIndex + 1)].joined(separator: "/"))
+        }
+        return roots.sorted()
+    }
+
+    /// Files belonging to a `.wallpaper` source bundle.
+    var sourceFiles: [PackageFile] {
+        let bundles = wallpaperBundles
+        guard !bundles.isEmpty else { return [] }
+        return files.filter { file in
+            bundles.contains { file.relativePath.hasPrefix($0 + "/") }
+        }
+    }
+
+    var sourceBytes: Int64 { sourceFiles.reduce(0) { $0 + $1.size } }
+
+    /// Largest previewable image inside the source bundle
+    /// (`files` is sorted by size descending).
+    var previewFile: PackageFile? {
+        sourceFiles.first { file in
+            let ext = (file.relativePath as NSString).pathExtension.lowercased()
+            return ["jpg", "jpeg", "png", "heic", "heif"].contains(ext)
+        }
+    }
+
+    /// Row title: the source bundle's name when one is present —
+    /// far more recognizable than a configuration UUID.
+    var listTitle: String {
+        guard let bundle = wallpaperBundles.first,
+              let last = bundle.split(separator: "/").last else { return displayName }
+        let name = String(last)
+        return name.hasSuffix(".wallpaper") ? String(name.dropLast(10)) : name
+    }
 }
 
 enum PosterPackageScanner {
@@ -799,6 +856,9 @@ enum PosterPackageScanner {
                     )
                     packages.append(package)
                     log("wallpaper-pkg: \(provider) cfg=\(cfg) name=\(name) files=\(files.count) bytes=\(package.totalBytes)")
+                    if !package.wallpaperBundles.isEmpty {
+                        log("wallpaper-pkg: source bundles cfg=\(cfg) bundles=\(package.wallpaperBundles) sourceFiles=\(package.sourceFiles.count) sourceBytes=\(package.sourceBytes)")
+                    }
                     for file in files.prefix(40) {
                         log("wallpaper-pkg:   file \(file.relativePath) bytes=\(file.size)")
                     }
@@ -983,24 +1043,44 @@ struct PosterPackageDetailView: View {
                         }
                     }
                 } header: {
-                    Text("\(package.files.count) 个文件 · 共 \(WallpaperModel.format(package.totalBytes))")
+                    VStack(alignment: .leading, spacing: 2) {
+                        Text("\(package.files.count) 个文件 · 共 \(WallpaperModel.format(package.totalBytes))")
+                        if !package.sourceFiles.isEmpty {
+                            Text("壁纸源包：\(package.sourceFiles.count) 个文件 · \(WallpaperModel.format(package.sourceBytes))")
+                        }
+                    }
                 }
             }
             .listStyle(.plain)
-            Button {
-                exportZip()
-            } label: {
-                if exporting {
-                    ProgressView()
-                } else {
-                    Label("导出整包（zip）", systemImage: "square.and.arrow.up")
+            VStack(spacing: 8) {
+                if !package.sourceFiles.isEmpty {
+                    Button {
+                        exportSourceZip()
+                    } label: {
+                        if exporting {
+                            ProgressView()
+                        } else {
+                            Label("只导出壁纸源包（zip）", systemImage: "square.and.arrow.up")
+                        }
+                    }
+                    .buttonStyle(.borderedProminent)
+                    .disabled(exporting)
                 }
+                Button {
+                    exportZip()
+                } label: {
+                    if exporting {
+                        ProgressView()
+                    } else {
+                        Label("导出整包（zip）", systemImage: "square.and.arrow.up")
+                    }
+                }
+                .buttonStyle(.bordered)
+                .disabled(exporting || package.files.isEmpty)
             }
-            .buttonStyle(.borderedProminent)
-            .disabled(exporting || package.files.isEmpty)
             .padding()
         }
-        .navigationTitle(package.displayName)
+        .navigationTitle(package.listTitle)
         .navigationBarTitleDisplayMode(.inline)
         .sheet(item: $sharePayload) { payload in
             ActivityView(items: [payload.url])
@@ -1031,6 +1111,65 @@ struct PosterPackageDetailView: View {
             DispatchQueue.main.async {
                 exporting = false
                 if ok { sharePayload = SharePayload(url: url) }
+            }
+        }
+    }
+
+    /// Zip ONLY the `.wallpaper` source subtree(s): entries are
+    /// rooted at the bundle folder itself, snapshots and metadata
+    /// of the configuration are left out.
+    private func exportSourceZip() {
+        exporting = true
+        let package = self.package
+        let containerPath = self.containerPath
+        DispatchQueue.global(qos: .userInitiated).async {
+            let cfgAbs = (containerPath as NSString).appendingPathComponent(package.relativePath)
+            let entries: [(String, String, Date)] = package.sourceFiles.map { file in
+                let components = file.relativePath.split(separator: "/").map(String.init)
+                let contentsIndex = components.firstIndex(of: "contents") ?? 0
+                let entryName = components[(contentsIndex + 1)...].joined(separator: "/")
+                return (
+                    entryName,
+                    (cfgAbs as NSString).appendingPathComponent(file.relativePath),
+                    file.modified
+                )
+            }
+            let url = FileManager.default.temporaryDirectory
+                .appendingPathComponent("\(package.listTitle).zip")
+            try? FileManager.default.removeItem(at: url)
+            let ok = ZipWriter.write(entries: entries, to: url)
+            log("wallpaper-pkg: export-source \(package.configID) ok=\(ok) entries=\(entries.count)")
+            DispatchQueue.main.async {
+                exporting = false
+                if ok { sharePayload = SharePayload(url: url) }
+            }
+        }
+    }
+}
+
+private struct PackagePreviewThumb: View {
+    let absolutePath: String
+    @State private var image: UIImage?
+
+    var body: some View {
+        ZStack {
+            Color.secondary.opacity(0.15)
+            if let image {
+                Image(uiImage: image)
+                    .resizable()
+                    .scaledToFill()
+            } else {
+                Image(systemName: "photo")
+                    .foregroundStyle(.secondary)
+            }
+        }
+        .frame(width: 46, height: 46)
+        .clipped()
+        .cornerRadius(6)
+        .task(id: absolutePath) {
+            image = nil
+            QQThumbnailLoader.load(path: absolutePath, maxPixel: 240) { loaded in
+                image = loaded
             }
         }
     }
