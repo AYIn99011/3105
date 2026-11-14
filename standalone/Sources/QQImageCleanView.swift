@@ -5,9 +5,9 @@ import ImageIO
 // MARK: - QQ chat image cleaner
 //
 // A dedicated tab for QQ (com.tencent.mqq): discovers the chat-image
-// directories inside QQ's data container by directory-name features
-// (the layout is never hardcoded — every hit is logged so the first
-// run can be cross-checked against QQ's own image count), then shows
+// stores inside QQ's data container by per-directory size shape
+// (names proved unreliable; every candidate is logged so a run can
+// be cross-checked against QQ's own image count), then shows
 // the images in a thumbnail grid with long-press brush selection and
 // a confirm-then-delete flow. Deletion goes through the inventory
 // service's fd-relative machinery, one relative path per file.
@@ -54,83 +54,104 @@ enum QQImageScanner {
         return false
     }
 
-    /// Walks the container once, collecting image files under matched
-    /// chat-image directories. Also returns per-directory statistics
-    /// for every image-named directory (matched or not) for the log.
-    static func scan(containerPath: String)
-        -> (items: [QQImageItem], matchedDirs: [String], candidateStats: [(String, Int, Int64)])
-    {
-        let root = containerPath as NSString
-        // Pass 1: discover directories.
-        var allDirs: [String] = []
+    struct ScanResult {
+        let items: [QQImageItem]
+        let matchedDirs: [String]
+        let dirStats: [(String, Int, Int64)]
+    }
+
+    /// One pass over the whole container, collecting every image file
+    /// and rolling sizes up per ancestor directory. Directory names
+    /// alone proved unreliable (a generic "image" folder held QQ's
+    /// built-in sticker art), so chat-image stores are picked by
+    /// shape: large total bytes and a large average file size, which
+    /// sticker/avatar stores (many tiny files) cannot fake. Emoticon
+    /// and avatar subtrees are excluded by name regardless of shape.
+    static func scan(containerPath: String) -> ScanResult {
+        let rootLength = (containerPath as NSString).length
+        var files: [(rel: String, size: Int64)] = []
         if let enumerator = FileManager.default.enumerator(
             at: URL(fileURLWithPath: containerPath),
-            includingPropertiesForKeys: [.isDirectoryKey],
+            includingPropertiesForKeys: [.isRegularFileKey, .fileSizeKey],
             options: [.skipsHiddenFiles]
         ) {
-            for case let url as URL in enumerator {
-                guard (try? url.resourceValues(forKeys: [.isDirectoryKey]))?.isDirectory == true
-                else { continue }
-                allDirs.append(url.path)
-            }
-        }
-        let matched = allDirs.filter { isChatImageDirectory(($0 as NSString).lastPathComponent) }
-        // Drop matched dirs nested inside another matched dir.
-        let matchedSet = Set(matched)
-        let topMatched = matched.filter { dir in
-            var parent = (dir as NSString).deletingLastPathComponent
-            while parent.hasPrefix(containerPath) && parent != containerPath {
-                if matchedSet.contains(parent) { return false }
-                parent = (parent as NSString).deletingLastPathComponent
-            }
-            return true
-        }
-
-        // Pass 2: collect files under matched dirs; gather stats for
-        // every directory whose name mentions images.
-        var items: [QQImageItem] = []
-        var stats: [String: (count: Int, bytes: Int64)] = [:]
-        for dir in topMatched {
-            guard let enumerator = FileManager.default.enumerator(
-                at: URL(fileURLWithPath: dir),
-                includingPropertiesForKeys: [.isRegularFileKey, .fileSizeKey],
-                options: [.skipsHiddenFiles]
-            ) else { continue }
             for case let url as URL in enumerator {
                 let values = try? url.resourceValues(forKeys: [.isRegularFileKey, .fileSizeKey])
                 guard values?.isRegularFile == true else { continue }
                 let name = url.lastPathComponent
-                guard isImageFile(at: url.path, name: name) else { continue }
-                let size = Int64(values?.fileSize ?? 0)
-                let relative = String(url.path.dropFirst(root.length + 1))
-                items.append(QQImageItem(relativePath: relative, size: size))
+                let ext = (name as NSString).pathExtension.lowercased()
+                var image = imageExtensions.contains(ext)
+                if !image && ext.isEmpty && Int64(values?.fileSize ?? 0) >= 10_240 {
+                    image = isImageFile(at: url.path, name: name)
+                }
+                guard image else { continue }
+                let rel = String(url.path.dropFirst(rootLength + 1))
+                files.append((rel, Int64(values?.fileSize ?? 0)))
             }
         }
-        for dir in allDirs where (dir as NSString).lastPathComponent.lowercased().contains("image") {
-            guard let enumerator = FileManager.default.enumerator(
-                at: URL(fileURLWithPath: dir),
-                includingPropertiesForKeys: [.isRegularFileKey, .fileSizeKey],
-                options: [.skipsHiddenFiles]
-            ) else { continue }
-            var count = 0
-            var bytes: Int64 = 0
-            for case let url as URL in enumerator {
-                let values = try? url.resourceValues(forKeys: [.isRegularFileKey, .fileSizeKey])
-                guard values?.isRegularFile == true else { continue }
-                guard imageExtensions.contains(url.pathExtension.lowercased()) else { continue }
-                count += 1
-                bytes += Int64(values?.fileSize ?? 0)
+
+        // Roll every file's size up into each ancestor directory.
+        var rollup: [String: (count: Int, bytes: Int64)] = [:]
+        for file in files {
+            var dir = (file.rel as NSString).deletingLastPathComponent
+            while !dir.isEmpty && dir != "." {
+                var entry = rollup[dir] ?? (0, 0)
+                entry.count += 1
+                entry.bytes += file.size
+                rollup[dir] = entry
+                dir = (dir as NSString).deletingLastPathComponent
             }
-            if count > 0 {
-                stats[String(dir.dropFirst(root.length + 1))] = (count, bytes)
+        }
+
+        let structural: Set<String> = ["Documents", "Library", "tmp"]
+        func excluded(_ dir: String) -> Bool {
+            if structural.contains(dir) { return true }
+            let lower = dir.lowercased()
+            return lower.contains("emoticon") || lower.contains("sticker")
+                || lower.contains("expression") || lower.contains("emoji")
+                || lower.contains("avatar")
+        }
+
+        var candidates: [(dir: String, count: Int, bytes: Int64)] = []
+        for (dir, stat) in rollup where !excluded(dir) {
+            guard dir.split(separator: "/").count >= 2 else { continue }
+            let avg = stat.bytes / Int64(max(stat.count, 1))
+            guard avg >= 60_000 else { continue }
+            let nameHit = isChatImageDirectory((dir as NSString).lastPathComponent)
+            if stat.bytes >= 30_000_000 || (nameHit && stat.bytes >= 5_000_000) {
+                candidates.append((dir, stat.count, stat.bytes))
             }
+        }
+        // Deepest first; keep picks non-overlapping.
+        candidates.sort {
+            $0.dir.split(separator: "/").count > $1.dir.split(separator: "/").count
+        }
+        var picked: [String] = []
+        for cand in candidates {
+            let overlaps = picked.contains { pick in
+                cand.dir.hasPrefix(pick + "/") || pick.hasPrefix(cand.dir + "/")
+            }
+            if !overlaps { picked.append(cand.dir) }
+        }
+        if picked.isEmpty,
+           let best = rollup
+            .filter({ !excluded($0.key) && $0.key.split(separator: "/").count >= 2 })
+            .max(by: { $0.value.bytes < $1.value.bytes }) {
+            picked = [best.key]
+            log("qqimg: fallback picked largest image dir \(best.key) bytes=\(best.value.bytes)")
+        }
+
+        var items: [QQImageItem] = []
+        for file in files where picked.contains(where: { file.rel.hasPrefix($0 + "/") }) {
+            items.append(QQImageItem(relativePath: file.rel, size: file.size))
         }
         items.sort { $0.size > $1.size }
-        let candidates = stats
+        let stats = rollup
             .map { ($0.key, $0.value.count, $0.value.bytes) }
             .sorted { $0.2 > $1.2 }
-        return (items, topMatched.map { String($0.dropFirst(root.length + 1)) }, candidates)
+        return ScanResult(items: items, matchedDirs: picked.sorted(), dirStats: stats)
     }
+}
 }
 
 enum QQThumbnailLoader {
@@ -238,8 +259,8 @@ final class QQImageModel: ObservableObject {
         for dir in scan.matchedDirs {
             log("qqimg: matched dir \(dir)")
         }
-        for (dir, count, bytes) in scan.candidateStats.prefix(20) {
-            log("qqimg: image-dir candidate \(dir) files=\(count) bytes=\(bytes)")
+        for (dir, count, bytes) in scan.dirStats.prefix(30) {
+            log("qqimg: dir-stat \(dir) files=\(count) bytes=\(bytes)")
         }
         log("qqimg: total images=\(scan.items.count) bytes=\(scan.items.reduce(0) { $0 + $1.size })")
         if scan.items.isEmpty {
@@ -391,6 +412,7 @@ struct QQImageCleanView: View {
     @State private var brushing = false
     @State private var previewItem: QQImageItem?
     @State private var confirmDelete = false
+    @State private var viewportHeight: CGFloat = 0
 
     private let columns = [GridItem](repeating: GridItem(.flexible(), spacing: 3), count: 4)
 
@@ -494,31 +516,47 @@ struct QQImageCleanView: View {
     }
 
     private var grid: some View {
-        ScrollViewReader { proxy in
-            ScrollView {
-                if model.items.isEmpty && !model.isScanning {
-                    ContentUnavailableView(
-                        "没有图片",
-                        systemImage: "photo.slash",
-                        description: Text(model.statusText ?? "未发现聊天图片。")
-                    )
-                    .padding(.top, 60)
-                } else {
-                    LazyVGrid(columns: columns, spacing: 3) {
-                        ForEach(Array(model.items.enumerated()), id: \.element.id) { index, item in
-                            cell(index: index, item: item)
+        // Frames and the brush drag share the QQVIEW *viewport*
+        // coordinate space. The v1 build measured both in the scroll
+        // content's space, where a scrolling finger looks stationary —
+        // the long-press fired mid-scroll and scrollDisabled froze the
+        // list for good.
+        ZStack {
+            ScrollViewReader { proxy in
+                ScrollView {
+                    if model.items.isEmpty && !model.isScanning {
+                        ContentUnavailableView(
+                            "没有图片",
+                            systemImage: "photo.slash",
+                            description: Text(model.statusText ?? "未发现聊天图片。")
+                        )
+                        .padding(.top, 60)
+                    } else {
+                        LazyVGrid(columns: columns, spacing: 3) {
+                            ForEach(Array(model.items.enumerated()), id: \.element.id) { index, item in
+                                cell(index: index, item: item)
+                            }
                         }
+                        .padding(3)
+                        .onPreferenceChange(QQCellFrameKey.self) { frames in
+                            cellFrames = frames
+                        }
+                        .gesture(brushGesture(proxy: proxy))
                     }
-                    .padding(3)
-                    .onPreferenceChange(QQCellFrameKey.self) { frames in
-                        cellFrames = frames
-                    }
-                    .gesture(brushGesture(proxy: proxy))
                 }
+                .scrollDisabled(brushing)
             }
-            .coordinateSpace(name: "QQGRID")
-            .scrollDisabled(brushing)
         }
+        .background(
+            GeometryReader { geo in
+                Color.clear
+                    .onAppear { viewportHeight = geo.size.height }
+                    .onChange(of: geo.size.height) { _, newValue in
+                        viewportHeight = newValue
+                    }
+            }
+        )
+        .coordinateSpace(name: "QQVIEW")
     }
 
     private func cell(index: Int, item: QQImageItem) -> some View {
@@ -543,7 +581,7 @@ struct QQImageCleanView: View {
             GeometryReader { geo in
                 Color.clear.preference(
                     key: QQCellFrameKey.self,
-                    value: [index: geo.frame(in: .named("QQGRID"))]
+                    value: [index: geo.frame(in: .named("QQVIEW"))]
                 )
             }
         )
@@ -581,7 +619,7 @@ struct QQImageCleanView: View {
 
     private func brushGesture(proxy: ScrollViewProxy) -> some Gesture {
         LongPressGesture(minimumDuration: 0.2)
-            .sequenced(before: DragGesture(minimumDistance: 0, coordinateSpace: .named("QQGRID")))
+            .sequenced(before: DragGesture(minimumDistance: 0, coordinateSpace: .named("QQVIEW")))
             .onChanged { value in
                 guard case .second(true, let dragValue) = value, let drag = dragValue else { return }
                 guard let index = indexAt(drag.location) else { return }
@@ -592,14 +630,19 @@ struct QQImageCleanView: View {
                     brushing = true
                 }
                 brushCurrent = index
-                // Edge auto-scroll while brushing.
+                // Edge auto-scroll while brushing: finger near the
+                // viewport edge, or sitting on the last rendered row.
+                let nearBottom = drag.location.y > viewportHeight - 70
+                let nearTop = drag.location.y < 70
                 if let maxRendered = cellFrames.keys.max(),
-                   index >= maxRendered, maxRendered < model.items.count - 1 {
+                   (nearBottom || index >= maxRendered),
+                   maxRendered < model.items.count - 1 {
                     withAnimation(.linear(duration: 0.12)) {
                         proxy.scrollTo(model.items[maxRendered].id, anchor: .bottom)
                     }
                 } else if let minRendered = cellFrames.keys.min(),
-                          index <= minRendered, minRendered > 0 {
+                          (nearTop || index <= minRendered),
+                          minRendered > 0 {
                     withAnimation(.linear(duration: 0.12)) {
                         proxy.scrollTo(model.items[minRendered].id, anchor: .top)
                     }
