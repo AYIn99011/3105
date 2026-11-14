@@ -14,6 +14,9 @@ struct QingsaoApp: App {
                 CleanerView()
                     .tabItem { Label("清理", systemImage: "trash") }
 
+                QQImageCleanView()
+                    .tabItem { Label("QQ清理", systemImage: "photo.stack") }
+
                 LogView()
                     .tabItem { Label("日志", systemImage: "doc.text") }
             }
