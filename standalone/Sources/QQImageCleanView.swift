@@ -175,7 +175,7 @@ final class QQImageModel: ObservableObject {
     private(set) var containerPath: String?
     private var didLoad = false
 
-    static let qqBundleID = "com.tencent.mqq"
+    nonisolated static let qqBundleID = "com.tencent.mqq"
 
     var selectedItems: [QQImageItem] { items.filter { selected.contains($0.relativePath) } }
     var selectedBytes: Int64 { selectedItems.reduce(0) { $0 + $1.size } }
@@ -583,7 +583,7 @@ struct QQImageCleanView: View {
         LongPressGesture(minimumDuration: 0.2)
             .sequenced(before: DragGesture(minimumDistance: 0, coordinateSpace: .named("QQGRID")))
             .onChanged { value in
-                guard case .second(true, let drag?) = value, let drag else { return }
+                guard case .second(true, let dragValue) = value, let drag = dragValue else { return }
                 guard let index = indexAt(drag.location) else { return }
                 if brushAnchor == nil {
                     brushAnchor = index
