@@ -32,6 +32,8 @@ enum CPBitmapDecoder {
     static func decode(path: String) -> UIImage? {
         guard let data = try? Data(contentsOf: URL(fileURLWithPath: path)) else { return nil }
         let name = (path as NSString).lastPathComponent
+        let magic = data.prefix(16).map { String(format: "%02x", $0) }.joined(separator: " ")
+        log("wallpaper: cpbitmap \(name) magic \(magic)")
         var pixelBytes = data.count
         var plistWidth: Int?
         var plistHeight: Int?
@@ -41,15 +43,21 @@ enum CPBitmapDecoder {
             pixelBytes = data.count - dims.trailerLength
             log("wallpaper: cpbitmap \(name) plist dims \(dims.width)x\(dims.height) trailer=\(dims.trailerLength)")
         }
+        var expectedHeight = plistHeight
         var widths: [Int] = []
         if let w = plistWidth { widths.append(w) }
+        if let dims = filenameDimensions(name) {
+            widths.append(dims.0)
+            if expectedHeight == nil { expectedHeight = dims.1 }
+            log("wallpaper: cpbitmap \(name) filename dims \(dims.0)x\(dims.1)")
+        }
         widths += [1320, 1290, 1260, 1206, 1179, 1170, 1284, 1242, 1125, 1080, 828, 750]
         for w in widths where w > 0 {
             for stride in candidateStrides(width: w) {
                 guard stride > 0, pixelBytes > 0, pixelBytes % stride == 0 else { continue }
                 let h = pixelBytes / stride
                 guard h > 0 else { continue }
-                if let fixed = plistHeight, h != fixed { continue }
+                if let fixed = expectedHeight, h != fixed { continue }
                 let ratio = Double(h) / Double(w)
                 guard ratio > 0.3, ratio < 3.5 else { continue }
                 if let image = render(data: data, pixelBytes: pixelBytes, width: w, height: h, stride: stride) {
@@ -60,6 +68,22 @@ enum CPBitmapDecoder {
         }
         log("wallpaper: cpbitmap \(name) decode failed bytes=\(data.count)")
         return nil
+    }
+
+    /// MappedImageCache names embed the render geometry, e.g.
+    /// `b[{{0, 0}, {440, 956}}]-s[3.000000]` = 440x956 pt at 3x.
+    private static func filenameDimensions(_ name: String) -> (Int, Int)? {
+        guard let regex = try? NSRegularExpression(
+            pattern: "\\{(\\d+),\\s*(\\d+)\\}\\]-s\\[(\\d+(?:\\.\\d+)?)\\]"
+        ) else { return nil }
+        let range = NSRange(name.startIndex..., in: name)
+        guard let match = regex.firstMatch(in: name, range: range),
+              let r1 = Range(match.range(at: 1), in: name),
+              let r2 = Range(match.range(at: 2), in: name),
+              let r3 = Range(match.range(at: 3), in: name),
+              let w = Double(name[r1]), let h = Double(name[r2]), let s = Double(name[r3])
+        else { return nil }
+        return (Int(w * s), Int(h * s))
     }
 
     private static func candidateStrides(width w: Int) -> [Int] {
@@ -177,6 +201,17 @@ enum WallpaperScanner {
                 ))
             }
         }
+        // The container also holds watch-complication snapshots and
+        // poster preview renders (MappedImageCache) — what counts as
+        // "wallpaper" here is the configured posters themselves (the
+        // PRB extension data store) plus the full-screen V16 renders
+        // of the current home/lock posters.
+        let unfiltered = items.count
+        items = items.filter {
+            $0.relativePath.hasPrefix("Library/Application Support/PRBPosterExtensionDataStore/")
+                || $0.fileName.hasPrefix("V16-OS")
+        }
+        log("wallpaper: filter kept=\(items.count) excluded=\(unfiltered - items.count)")
         items.sort { $0.modified > $1.modified }
         return items
     }
@@ -190,7 +225,7 @@ enum WallpaperImageLoader {
     /// Full-size image for previews and PNG export.
     static func loadFull(item: WallpaperItem, absolutePath: String, completion: @escaping (UIImage?) -> Void) {
         if item.isCPBitmap {
-            loadCPBitmap(path: absolutePath, completion: completion)
+            loadCPBitmap(path: absolutePath, maxPixel: 2400, completion: completion)
         } else {
             QQThumbnailLoader.load(path: absolutePath, maxPixel: 2400) { completion($0) }
         }
@@ -198,26 +233,42 @@ enum WallpaperImageLoader {
 
     static func loadThumbnail(item: WallpaperItem, absolutePath: String, completion: @escaping (UIImage?) -> Void) {
         if item.isCPBitmap {
-            loadCPBitmap(path: absolutePath) { full in
-                guard let full else { completion(nil); return }
-                let maxPixel = 360.0
-                let scale = min(1.0, maxPixel / max(full.size.width, full.size.height))
-                if scale >= 1.0 { completion(full); return }
-                let target = CGSize(
-                    width: (full.size.width * scale).rounded(),
-                    height: (full.size.height * scale).rounded()
-                )
-                let renderer = UIGraphicsImageRenderer(size: target)
-                completion(renderer.image { _ in
-                    full.draw(in: CGRect(origin: .zero, size: target))
-                })
-            }
+            loadCPBitmap(path: absolutePath, maxPixel: 360, completion: completion)
         } else {
             QQThumbnailLoader.load(path: absolutePath, maxPixel: 360) { completion($0) }
         }
     }
 
-    private static func loadCPBitmap(path: String, completion: @escaping (UIImage?) -> Void) {
+    /// Modern PosterBoard ".cpbitmap" files are often ordinary
+    /// encoded images under a bitmap name (their sizes are not even
+    /// divisible by 4, so they cannot be raw BGRA dumps): let ImageIO
+    /// sniff the payload first, and only fall back to the raw
+    /// cpbitmap decoder when ImageIO cannot read the file.
+    private static func loadCPBitmap(path: String, maxPixel: Int, completion: @escaping (UIImage?) -> Void) {
+        QQThumbnailLoader.load(path: path, maxPixel: maxPixel) { image in
+            if let image {
+                log("wallpaper: cpbitmap imageio decoded \((path as NSString).lastPathComponent)")
+                completion(image)
+                return
+            }
+            loadRawCPBitmap(path: path) { raw in
+                guard let raw else { completion(nil); return }
+                let limit = Double(maxPixel)
+                let scale = min(1.0, limit / max(raw.size.width, raw.size.height))
+                if scale >= 1.0 { completion(raw); return }
+                let target = CGSize(
+                    width: (raw.size.width * scale).rounded(),
+                    height: (raw.size.height * scale).rounded()
+                )
+                let renderer = UIGraphicsImageRenderer(size: target)
+                completion(renderer.image { _ in
+                    raw.draw(in: CGRect(origin: .zero, size: target))
+                })
+            }
+        }
+    }
+
+    private static func loadRawCPBitmap(path: String, completion: @escaping (UIImage?) -> Void) {
         let key = path as NSString
         if let hit = cpCache.object(forKey: key) {
             completion(hit)

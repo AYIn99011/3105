@@ -11,6 +11,9 @@ struct InventoryEntry: Identifiable, Equatable {
     var bytes: Int64
     var itemCount: Int
     let isProtected: Bool
+    /// The entry's own modification time (for a directory, the
+    /// directory's mtime — not the newest file inside it).
+    let modified: Date
 
     var id: String { relativePath }
 }
@@ -40,6 +43,11 @@ enum ContainerInventoryService {
         if name.hasSuffix(".archiver") { return true }
         if name == ".com.apple.mobile_container_manager.metadata.plist" { return true }
         return false
+    }
+
+    static func modificationDate(_ information: stat) -> Date {
+        Date(timeIntervalSince1970: Double(information.st_mtimespec.tv_sec)
+            + Double(information.st_mtimespec.tv_nsec) / 1_000_000_000)
     }
 
     static func isDefaultSelected(relativePath: String) -> Bool {
@@ -79,7 +87,8 @@ enum ContainerInventoryService {
                     isSymlink: false,
                     bytes: max(0, Int64(information.st_size)),
                     itemCount: 1,
-                    isProtected: isProtected(relativePath: childRelativePath)
+                    isProtected: isProtected(relativePath: childRelativePath),
+                    modified: modificationDate(information)
                 ))
             case S_IFDIR:
                 let childDescriptor = name.withCString {
@@ -100,7 +109,8 @@ enum ContainerInventoryService {
                     isSymlink: false,
                     bytes: bytes,
                     itemCount: count,
-                    isProtected: isProtected(relativePath: childRelativePath)
+                    isProtected: isProtected(relativePath: childRelativePath),
+                    modified: modificationDate(information)
                 ))
             case S_IFLNK:
                 entries.append(InventoryEntry(
@@ -110,7 +120,8 @@ enum ContainerInventoryService {
                     isSymlink: true,
                     bytes: 0,
                     itemCount: 0,
-                    isProtected: true
+                    isProtected: true,
+                    modified: modificationDate(information)
                 ))
             default:
                 break
@@ -154,7 +165,8 @@ enum ContainerInventoryService {
                     isSymlink: false,
                     bytes: max(0, Int64(information.st_size)),
                     itemCount: 1,
-                    isProtected: isProtected(relativePath: childRelativePath)
+                    isProtected: isProtected(relativePath: childRelativePath),
+                    modified: modificationDate(information)
                 ))
             case S_IFDIR:
                 entries.append(InventoryEntry(
@@ -164,7 +176,8 @@ enum ContainerInventoryService {
                     isSymlink: false,
                     bytes: 0,
                     itemCount: 0,
-                    isProtected: isProtected(relativePath: childRelativePath)
+                    isProtected: isProtected(relativePath: childRelativePath),
+                    modified: modificationDate(information)
                 ))
             case S_IFLNK:
                 entries.append(InventoryEntry(
@@ -174,7 +187,8 @@ enum ContainerInventoryService {
                     isSymlink: true,
                     bytes: 0,
                     itemCount: 0,
-                    isProtected: true
+                    isProtected: true,
+                    modified: modificationDate(information)
                 ))
             default:
                 break

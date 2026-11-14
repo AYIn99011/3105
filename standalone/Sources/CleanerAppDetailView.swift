@@ -293,12 +293,19 @@ struct CleanerAppDetailView: View {
         }
     }
 
+    private static let timeFormatter: DateFormatter = {
+        let formatter = DateFormatter()
+        formatter.dateFormat = "yyyy-MM-dd HH:mm"
+        return formatter
+    }()
+
     private func subtitle(_ entry: InventoryEntry) -> String {
-        if entry.isSymlink { return "符号链接 · 不跟随" }
-        if !entry.isDirectory { return "文件" }
+        let time = Self.timeFormatter.string(from: entry.modified)
+        if entry.isSymlink { return "符号链接 · 不跟随 · \(time)" }
+        if !entry.isDirectory { return "文件 · \(time)" }
         return measuredPaths.contains(entry.relativePath)
-            ? "\(entry.itemCount) 个文件"
-            : "正在统计…"
+            ? "\(entry.itemCount) 个文件 · \(time)"
+            : "正在统计… · \(time)"
     }
 
     @ViewBuilder
