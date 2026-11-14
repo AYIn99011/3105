@@ -678,7 +678,7 @@ struct WallpaperView: View {
                                         .lineLimit(1)
                                         .truncationMode(.middle)
                                     Text("\(package.files.count) 个文件 · \(WallpaperModel.format(package.totalBytes)) · \(Self.rowTimeFormatter.string(from: package.modified))")
-                                        .font(".caption2)
+                                        .font(.caption2)
                                         .foregroundStyle(.secondary)
                                     if !package.wallpaperBundles.isEmpty {
                                         Text("含壁纸源包 · \(package.sourceFiles.count) 个文件 · \(WallpaperModel.format(package.sourceBytes))")
