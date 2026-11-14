@@ -287,6 +287,7 @@ enum WallpaperImageLoader {
 @MainActor
 final class WallpaperModel: ObservableObject {
     @Published var items: [WallpaperItem] = []
+    @Published var packages: [PosterPackage] = []
     @Published var isScanning = false
     @Published var statusText: String?
     private(set) var containerPath: String?
@@ -348,6 +349,10 @@ final class WallpaperModel: ObservableObject {
             WallpaperScanner.scan(containerPath: container)
         }.value
         items = scanned
+        let foundPackages = await Task.detached(priority: .userInitiated) {
+            PosterPackageScanner.scan(containerPath: container)
+        }.value
+        packages = foundPackages
         isScanning = false
         let formatter = DateFormatter()
         formatter.dateFormat = "yyyy-MM-dd HH:mm"
@@ -554,6 +559,7 @@ struct WallpaperView: View {
     @StateObject private var model = WallpaperModel()
     @State private var previewItem: WallpaperItem?
     @State private var sortBySize = false
+    @State private var section = 0
 
     private let columns = [GridItem](repeating: GridItem(.flexible(), spacing: 3), count: 3)
 
@@ -593,16 +599,25 @@ struct WallpaperView: View {
                 if model.isScanning {
                     ProgressView()
                     Text("正在扫描 PosterBoard 容器…")
+                } else if section == 0 {
+                    Text("共 \(model.packages.count) 个海报包")
                 } else {
                     Text("共 \(model.items.count) 张 · \(WallpaperModel.format(model.totalBytes))")
                 }
                 Spacer()
-                Button(sortBySize ? "按大小" : "按时间") {
-                    sortBySize.toggle()
+                if section == 1 {
+                    Button(sortBySize ? "按大小" : "按时间") {
+                        sortBySize.toggle()
+                    }
+                    .font(.subheadline)
                 }
-                .font(.subheadline)
             }
             .font(.subheadline)
+            Picker("模式", selection: $section) {
+                Text("海报包").tag(0)
+                Text("图片").tag(1)
+            }
+            .pickerStyle(.segmented)
             if let status = model.statusText {
                 Text(status)
                     .font(.footnote)
@@ -618,7 +633,72 @@ struct WallpaperView: View {
         .padding(.vertical, 8)
     }
 
+    @ViewBuilder
     private var content: some View {
+        if section == 0 {
+            packageList
+        } else {
+            imageGrid
+        }
+    }
+
+    private var packageList: some View {
+        ScrollView {
+            if model.packages.isEmpty && !model.isScanning {
+                ContentUnavailableView(
+                    "没有海报包",
+                    systemImage: "photo.slash",
+                    description: Text(model.statusText ?? "未发现海报配置。")
+                )
+                .padding(.top, 60)
+            } else {
+                LazyVStack(spacing: 0) {
+                    ForEach(model.packages) { package in
+                        NavigationLink {
+                            PosterPackageDetailView(
+                                package: package,
+                                containerPath: model.containerPath ?? ""
+                            )
+                        } label: {
+                            HStack(spacing: 10) {
+                                VStack(alignment: .leading, spacing: 2) {
+                                    Text(package.displayName)
+                                        .font(.subheadline.weight(.medium))
+                                        .lineLimit(1)
+                                        .truncationMode(.middle)
+                                    Text(package.providerID)
+                                        .font(.caption2)
+                                        .foregroundStyle(.secondary)
+                                        .lineLimit(1)
+                                        .truncationMode(.middle)
+                                    Text("\(package.files.count) 个文件 · \(WallpaperModel.format(package.totalBytes)) · \(Self.rowTimeFormatter.string(from: package.modified))")
+                                        .font(.caption2)
+                                        .foregroundStyle(.secondary)
+                                }
+                                Spacer()
+                                Image(systemName: "chevron.right")
+                                    .font(.caption.weight(.semibold))
+                                    .foregroundStyle(.tertiary)
+                            }
+                            .padding(.horizontal, 12)
+                            .padding(.vertical, 8)
+                            .contentShape(Rectangle())
+                        }
+                        .buttonStyle(.plain)
+                        Divider().padding(.leading, 12)
+                    }
+                }
+            }
+        }
+    }
+
+    private static let rowTimeFormatter: DateFormatter = {
+        let formatter = DateFormatter()
+        formatter.dateFormat = "yyyy-MM-dd HH:mm"
+        return formatter
+    }()
+
+    private var imageGrid: some View {
         ScrollView {
             if model.items.isEmpty && !model.isScanning {
                 ContentUnavailableView(
@@ -642,5 +722,311 @@ struct WallpaperView: View {
     private func absolutePath(for item: WallpaperItem) -> String {
         guard let container = model.containerPath else { return item.relativePath }
         return (container as NSString).appendingPathComponent(item.relativePath)
+    }
+}
+
+// MARK: - Poster packages (whole-configuration export)
+
+struct PackageFile: Identifiable, Equatable {
+    /// Path relative to the configuration directory.
+    let relativePath: String
+    let size: Int64
+    let modified: Date
+    var id: String { relativePath }
+}
+
+/// One poster configuration inside the PRB extension data store:
+/// a provider's `configurations/<UUID>` directory, holding every
+/// version and content file of one configured poster. Interactive
+/// (.tendies) posters live here too — their assets are videos and
+/// descriptor plists, not images, so the image grid never sees them.
+struct PosterPackage: Identifiable, Equatable {
+    /// Configuration directory, relative to the container root.
+    let relativePath: String
+    let providerID: String
+    let configID: String
+    let displayName: String
+    let files: [PackageFile]
+    var id: String { relativePath }
+    var totalBytes: Int64 { files.reduce(0) { $0 + $1.size } }
+    var modified: Date { files.map(\.modified).max() ?? .distantPast }
+}
+
+enum PosterPackageScanner {
+    static func scan(containerPath: String) -> [PosterPackage] {
+        let storeRel = "Library/Application Support/PRBPosterExtensionDataStore"
+        let storeAbs = (containerPath as NSString).appendingPathComponent(storeRel)
+        var packages: [PosterPackage] = []
+        guard let versions = try? FileManager.default.contentsOfDirectory(atPath: storeAbs) else {
+            log("wallpaper-pkg: store not found at \(storeRel)")
+            return []
+        }
+        for version in versions {
+            let extRoot = "\(storeRel)/\(version)/Extensions"
+            let extAbs = (containerPath as NSString).appendingPathComponent(extRoot)
+            guard let providers = try? FileManager.default.contentsOfDirectory(atPath: extAbs) else { continue }
+            for provider in providers {
+                let cfgRoot = "\(extRoot)/\(provider)/configurations"
+                let cfgRootAbs = (containerPath as NSString).appendingPathComponent(cfgRoot)
+                guard let configs = try? FileManager.default.contentsOfDirectory(atPath: cfgRootAbs) else { continue }
+                for cfg in configs {
+                    let cfgRel = "\(cfgRoot)/\(cfg)"
+                    let cfgAbs = (containerPath as NSString).appendingPathComponent(cfgRel)
+                    var files: [PackageFile] = []
+                    if let enumerator = FileManager.default.enumerator(
+                        at: URL(fileURLWithPath: cfgAbs),
+                        includingPropertiesForKeys: [.isRegularFileKey, .fileSizeKey, .contentModificationDateKey],
+                        options: []
+                    ) {
+                        let rootLength = (cfgAbs as NSString).length
+                        for case let url as URL in enumerator {
+                            let values = try? url.resourceValues(
+                                forKeys: [.isRegularFileKey, .fileSizeKey, .contentModificationDateKey]
+                            )
+                            guard values?.isRegularFile == true else { continue }
+                            files.append(PackageFile(
+                                relativePath: String(url.path.dropFirst(rootLength + 1)),
+                                size: Int64(values?.fileSize ?? 0),
+                                modified: values?.contentModificationDate ?? .distantPast
+                            ))
+                        }
+                    }
+                    files.sort { $0.size > $1.size }
+                    let name = displayName(cfgAbs: cfgAbs, files: files) ?? cfg
+                    let package = PosterPackage(
+                        relativePath: cfgRel, providerID: provider,
+                        configID: cfg, displayName: name, files: files
+                    )
+                    packages.append(package)
+                    log("wallpaper-pkg: \(provider) cfg=\(cfg) name=\(name) files=\(files.count) bytes=\(package.totalBytes)")
+                    for file in files.prefix(40) {
+                        log("wallpaper-pkg:   file \(file.relativePath) bytes=\(file.size)")
+                    }
+                }
+            }
+        }
+        packages.sort { $0.modified > $1.modified }
+        log("wallpaper-pkg: total packages=\(packages.count)")
+        return packages
+    }
+
+    /// Best-effort display name: hunt the configuration's shallow
+    /// plist files for a human-readable name key.
+    private static func displayName(cfgAbs: String, files: [PackageFile]) -> String? {
+        let keys = ["name", "posterName", "displayName", "title", "Name", "Title"]
+        for file in files
+        where file.relativePath.hasSuffix(".plist")
+            && file.relativePath.split(separator: "/").count <= 2 {
+            let path = (cfgAbs as NSString).appendingPathComponent(file.relativePath)
+            guard let data = try? Data(contentsOf: URL(fileURLWithPath: path)),
+                  let object = try? PropertyListSerialization.propertyList(from: data, options: [], format: nil),
+                  let dict = object as? [String: Any] else { continue }
+            log("wallpaper-pkg: plist \(file.relativePath) keys=\(Array(dict.keys).sorted())")
+            for key in keys {
+                if let value = dict[key] as? String, !value.isEmpty { return value }
+            }
+        }
+        return nil
+    }
+}
+
+// MARK: - Minimal stored-zip writer
+
+/// Just enough ZIP to hand a directory tree to the Files app:
+/// stored (uncompressed) entries, CRC-32, UTF-8 names. Files are
+/// streamed in chunks — poster videos never sit in memory whole.
+enum ZipWriter {
+    private static let crcTable: [UInt32] = (0..<256).map { i -> UInt32 in
+        var c = UInt32(i)
+        for _ in 0..<8 { c = (c & 1) != 0 ? 0xEDB8_8320 ^ (c >> 1) : c >> 1 }
+        return c
+    }
+
+    private static func crc32<S: Sequence>(bytes: S, crc: UInt32) -> UInt32 where S.Element == UInt8 {
+        var c = crc ^ 0xFFFF_FFFF
+        for byte in bytes {
+            c = crcTable[Int((c ^ UInt32(byte)) & 0xFF)] ^ (c >> 8)
+        }
+        return c ^ 0xFFFF_FFFF
+    }
+
+    private static func dosDateTime(_ date: Date) -> (UInt16, UInt16) {
+        let cal = Calendar.current
+        let c = cal.dateComponents([.year, .month, .day, .hour, .minute, .second], from: date)
+        let year = max(1980, c.year ?? 1980)
+        let time = UInt16(((c.hour ?? 0) << 11) | ((c.minute ?? 0) << 5) | ((c.second ?? 0) / 2))
+        let day = UInt16(((year - 1980) << 9) | ((c.month ?? 1) << 5) | (c.day ?? 1))
+        return (time, day)
+    }
+
+    /// entries: (archive name, absolute source path, mtime)
+    static func write(entries: [(String, String, Date)], to url: URL) -> Bool {
+        FileManager.default.createFile(atPath: url.path, contents: nil)
+        guard let out = try? FileHandle(forWritingTo: url) else { return false }
+        defer { try? out.close() }
+        var offset: UInt64 = 0
+        var central: [(String, UInt32, UInt32, UInt32, UInt16, UInt16)] = []
+
+        func append(_ data: Data) {
+            out.write(data)
+            offset += UInt64(data.count)
+        }
+        func u16(_ v: UInt16) -> Data { withUnsafeBytes(of: v.littleEndian) { Data($0) } }
+        func u32(_ v: UInt32) -> Data { withUnsafeBytes(of: v.littleEndian) { Data($0) } }
+
+        for (name, source, modified) in entries {
+            guard let input = try? FileHandle(forReadingFrom: URL(fileURLWithPath: source)) else { return false }
+            // Pass 1: CRC + size.
+            var crc: UInt32 = 0
+            var size: UInt64 = 0
+            while let chunk = try? input.read(upToCount: 1 << 20), !chunk.isEmpty {
+                crc = crc32(bytes: chunk, crc: crc)
+                size += UInt64(chunk.count)
+            }
+            guard size <= UInt64(UInt32.max) else { try? input.close(); return false }
+            try? input.seek(toOffset: 0)
+            let nameData = Data(name.utf8)
+            let (time, day) = dosDateTime(modified)
+            let localOffset = UInt32(offset)
+            var header = Data()
+            header.append(u32(0x0403_4B50))
+            header.append(u16(20))
+            header.append(u16(0x0800))
+            header.append(u16(0))
+            header.append(u16(time))
+            header.append(u16(day))
+            header.append(u32(crc))
+            header.append(u32(UInt32(size)))
+            header.append(u32(UInt32(size)))
+            header.append(u16(UInt16(nameData.count)))
+            header.append(u16(0))
+            header.append(nameData)
+            append(header)
+            // Pass 2: copy payload.
+            while let chunk = try? input.read(upToCount: 1 << 20), !chunk.isEmpty {
+                append(chunk)
+            }
+            try? input.close()
+            central.append((name, crc, UInt32(size), localOffset, time, day))
+        }
+
+        let centralStart = offset
+        for (name, crc, size, localOffset, time, day) in central {
+            let nameData = Data(name.utf8)
+            var record = Data()
+            record.append(u32(0x0201_4B50))
+            record.append(u16(20))
+            record.append(u16(20))
+            record.append(u16(0x0800))
+            record.append(u16(0))
+            record.append(u16(time))
+            record.append(u16(day))
+            record.append(u32(crc))
+            record.append(u32(size))
+            record.append(u32(size))
+            record.append(u16(UInt16(nameData.count)))
+            record.append(u16(0))
+            record.append(u16(0))
+            record.append(u16(0))
+            record.append(u16(0))
+            record.append(u32(0))
+            record.append(u32(localOffset))
+            record.append(nameData)
+            append(record)
+        }
+        var end = Data()
+        end.append(u32(0x0605_4B50))
+        end.append(u16(0))
+        end.append(u16(0))
+        end.append(u16(UInt16(central.count)))
+        end.append(u16(UInt16(central.count)))
+        end.append(u32(UInt32(offset - centralStart)))
+        end.append(u32(UInt32(centralStart)))
+        end.append(u16(0))
+        append(end)
+        return true
+    }
+}
+
+// MARK: - Poster package detail
+
+struct PosterPackageDetailView: View {
+    let package: PosterPackage
+    let containerPath: String
+    @State private var sharePayload: SharePayload?
+    @State private var exporting = false
+
+    private static let timeFormatter: DateFormatter = {
+        let formatter = DateFormatter()
+        formatter.dateFormat = "yyyy-MM-dd HH:mm"
+        return formatter
+    }()
+
+    var body: some View {
+        VStack(spacing: 0) {
+            List {
+                Section {
+                    ForEach(package.files) { file in
+                        VStack(alignment: .leading, spacing: 2) {
+                            Text(file.relativePath)
+                                .font(.caption)
+                                .lineLimit(2)
+                                .truncationMode(.middle)
+                            Text("\(WallpaperModel.format(file.size)) · \(Self.timeFormatter.string(from: file.modified))")
+                                .font(.caption2)
+                                .foregroundStyle(.secondary)
+                        }
+                    }
+                } header: {
+                    Text("\(package.files.count) 个文件 · 共 \(WallpaperModel.format(package.totalBytes))")
+                }
+            }
+            .listStyle(.plain)
+            Button {
+                exportZip()
+            } label: {
+                if exporting {
+                    ProgressView()
+                } else {
+                    Label("导出整包（zip）", systemImage: "square.and.arrow.up")
+                }
+            }
+            .buttonStyle(.borderedProminent)
+            .disabled(exporting || package.files.isEmpty)
+            .padding()
+        }
+        .navigationTitle(package.displayName)
+        .navigationBarTitleDisplayMode(.inline)
+        .sheet(item: $sharePayload) { payload in
+            ActivityView(items: [payload.url])
+        }
+    }
+
+    private func exportZip() {
+        exporting = true
+        let package = self.package
+        let containerPath = self.containerPath
+        DispatchQueue.global(qos: .userInitiated).async {
+            let cfgAbs = (containerPath as NSString).appendingPathComponent(package.relativePath)
+            let entries: [(String, String, Date)] = package.files.map { file in
+                (
+                    "\(package.configID)/\(file.relativePath)",
+                    (cfgAbs as NSString).appendingPathComponent(file.relativePath),
+                    file.modified
+                )
+            }
+            let safeName = package.displayName
+                .replacingOccurrences(of: "/", with: "_")
+                .replacingOccurrences(of: ":", with: "_")
+            let url = FileManager.default.temporaryDirectory
+                .appendingPathComponent("\(safeName).zip")
+            try? FileManager.default.removeItem(at: url)
+            let ok = ZipWriter.write(entries: entries, to: url)
+            log("wallpaper-pkg: export \(package.configID) ok=\(ok) entries=\(entries.count)")
+            DispatchQueue.main.async {
+                exporting = false
+                if ok { sharePayload = SharePayload(url: url) }
+            }
+        }
     }
 }
