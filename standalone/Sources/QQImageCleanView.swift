@@ -152,7 +152,6 @@ enum QQImageScanner {
         return ScanResult(items: items, matchedDirs: picked.sorted(), dirStats: stats)
     }
 }
-}
 
 enum QQThumbnailLoader {
     private static let cache = NSCache<NSString, UIImage>()
